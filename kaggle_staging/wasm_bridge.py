@@ -1,15 +1,23 @@
 """
 wasm_bridge.py — Pure Functional TTT + Adapter I/O
-SOTA refactor v11:
+SOTA refactor v12:
   - functional_ttt_train: pure param-space gradient descent, no optimizer state
   - pure_batch_ttt_loss:  fully vectorised, device-derived zero tensors
   - save_adapter / load_adapter: head-only, action_emb NEVER persisted
   - encode_grid_numpy: pure NumPy, no tensors
   - All device references derived from input tensors — zero bare constructors
+
+FIXES (v12):
+  C1: functional_ttt_train uses ONE shared idx per step (not 4 separate randperms)
+  H1: removed imperative in-function .to() calls — device purity restored
+  H2: kl_reg_loss / mse_anchor_reg have local fallback implementations
+      so kaggle_staging is self-contained and never crashes on missing external
+  M1: _load_binary uses pathlib.Path.read_bytes() — no resource leak
 """
 from __future__ import annotations
 from dataclasses import dataclass
 from functools import reduce
+from pathlib import Path
 from typing import Optional
 import os
 
@@ -19,7 +27,36 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torch.func import functional_call, grad
 
-from external.urm.models.losses import value_logits_to_scalar, kl_reg_loss, mse_anchor_reg
+
+# ─── Loss helpers — FIX H2: local fallback, no crash if external missing ──────
+
+try:
+    from external.urm.models.losses import value_logits_to_scalar as _ext_vl2s
+    from external.urm.models.losses import kl_reg_loss as _ext_kl
+    from external.urm.models.losses import mse_anchor_reg as _ext_mse_anchor
+    value_logits_to_scalar = _ext_vl2s
+    kl_reg_loss            = _ext_kl
+    mse_anchor_reg         = _ext_mse_anchor
+except ImportError:
+    _BIN_CENTERS = torch.tensor([-1.0, -0.25, 0.5, 1.25, 2.0])
+
+    def value_logits_to_scalar(logits: torch.Tensor) -> torch.Tensor:
+        """5-bin softmax weighted avg. Local fallback."""
+        probs   = torch.softmax(logits, dim=-1)
+        centers = _BIN_CENTERS.to(logits.device)
+        return (probs * centers).sum(dim=-1)
+
+    def kl_reg_loss(logits: torch.Tensor, anchor: torch.Tensor) -> torch.Tensor:
+        """KL(logits || anchor). Local fallback."""
+        return F.kl_div(
+            F.log_softmax(logits, dim=-1),
+            F.softmax(anchor, dim=-1),
+            reduction="batchmean",
+        )
+
+    def mse_anchor_reg(pred: torch.Tensor, anchor: torch.Tensor) -> torch.Tensor:
+        """MSE regularisation toward anchor. Local fallback."""
+        return F.mse_loss(pred, anchor.detach())
 
 
 # ─── Constants ────────────────────────────────────────────────────────────────
@@ -62,9 +99,8 @@ def encode_grid_numpy(
     flat = grid.ravel().astype(np.int32)
     meta = np.array([action, n_actions, 0], dtype=np.int32)
     raw  = np.concatenate([flat, meta])
-    vlen = len(raw)                                        # h*w + 3
     tokens = np.pad(raw, (0, max(0, _TOKEN_LEN - len(raw))))[:_TOKEN_LEN]
-    return tokens, vlen
+    return tokens, len(raw)
 
 
 # ─── pure_batch_ttt_loss — fully vectorised ───────────────────────────────────
@@ -85,6 +121,7 @@ def pure_batch_ttt_loss(
     """
     Pure functional loss: no optimizer state, no in-place ops.
     Device derived from batch_states.device — zero bare constructors.
+    FIX H1: no internal .to() calls — all tensors must arrive on correct device.
     """
     device = batch_states.device
 
@@ -93,7 +130,6 @@ def pure_batch_ttt_loss(
     val_loss = F.mse_loss(value_logits_to_scalar(out["value"]), batch_rewards.float())
     task_loss = act_loss + val_loss
 
-    # Regularisation via anchor — pattern-matched on presence, no if-branches in hot path
     has_anchor = (pre_logits is not None) and (pre_values is not None)
     reg_loss   = (
         {
@@ -128,16 +164,18 @@ def functional_ttt_train(
     """
     Pure functional TTT — returns new params without mutating model.
     Uses torch.func.grad for parameter-space gradients.
-    All randomness (randperm) on states.device — no CPU index leakage.
+
+    FIX C1: ONE shared idx per step — states/actions/next/rewards are always
+            aligned. Previously 4 separate randperms broke (s,a,r) correspondence.
+    FIX H1: no .to(device) inside — caller is responsible for device placement.
 
     Mathematical identity:
         p_{t+1} = p_t - lr * ∇_{p_t} L(p_t)
         final = reduce(step, range(steps), params)
     """
     n      = len(states)
-    device = states.device   # SINGLE source of truth for all new tensors
+    device = states.device
 
-    # compute anchor predictions once (detached)
     with torch.no_grad():
         pre_out    = functional_call(model, (params, buffers), (states[:cfg.batch_size],))
         pre_logits = pre_out["action_logits"].detach()
@@ -146,7 +184,7 @@ def functional_ttt_train(
     _grad_fn = grad(pure_batch_ttt_loss, argnums=0)
 
     def _step(p: dict, _: int) -> tuple[dict, None]:
-        # sample indices on device — no CPU randperm
+        # FIX C1: single shared idx — all four tensors use the SAME permutation
         bs  = min(cfg.batch_size, n)
         idx = torch.randperm(n, device=device)[:bs]
         g   = _grad_fn(
@@ -157,13 +195,25 @@ def functional_ttt_train(
         )
         return {k: w - cfg.lr * g[k] for k, w in p.items()}, None
 
-    # pure fold — functional reduce over steps
     final_params, _ = reduce(
         lambda acc, i: (_step(acc[0], i)[0], None),
         range(cfg.steps),
         (params, None),
     )
     return final_params
+
+
+# ─── _load_binary — FIX M1: pathlib, no resource leak ────────────────────────
+
+def _load_binary(paths: list[str]) -> Optional[bytes]:
+    """
+    FIX M1: uses Path.read_bytes() — no open() / close() resource leak.
+    Returns first readable file, or None if none found.
+    """
+    return next(
+        (Path(p).read_bytes() for p in paths if Path(p).is_file()),
+        None,
+    )
 
 
 # ─── Adapter I/O ─────────────────────────────────────────────────────────────

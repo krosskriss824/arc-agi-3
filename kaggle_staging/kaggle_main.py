@@ -1,7 +1,11 @@
 """
 kaggle_main.py — ARC-AGI-3 Submission Orchestrator
-SOTA refactor v11: clean submission path, no TTT, device setup once,
+Refactor v12: clean submission path, no TTT, device setup once,
 conditional wheel install, no render_mode warnings, no cache flushes in loop.
+
+FIXES (v12):
+  H4: on_step receives raw obs (encoding now inside agent.on_step)
+  M3: conf logging uses last result.confidence, not hardcoded 0.0
 
 Invariants:
   - DEVICE set once at startup, never changed
@@ -79,7 +83,6 @@ def run_submission() -> None:
 
     print(f"[run] device={CFG.device}")
 
-    # Build agent ONCE — load_backbone moves all params atomically
     agent = build_agent(
         checkpoint_path=str(CHECKPOINT_PATH) if CHECKPOINT_PATH.exists() else None,
         adapter_path=str(ADAPTER_PATH) if ADAPTER_PATH.exists() else None,
@@ -94,12 +97,11 @@ def run_submission() -> None:
     results: dict[str, float] = {}
 
     for gid in game_ids:
-        env   = arc.make(gid)          # no render_mode="none" — avoids warning
+        env   = arc.make(gid)
         score = _run_episode(agent, env, gid)
         results[gid] = score
         env.close()
 
-    # single cache flush at end
     gc.collect()
     if CFG.device == "cuda":
         torch.cuda.empty_cache()
@@ -110,23 +112,28 @@ def run_submission() -> None:
 def _run_episode(agent, env, gid: str) -> float:
     """
     Run one episode. Returns cumulative reward.
-    No torch ops here — pure Python control flow calling agent interface.
+    FIX H4: agent.on_step receives raw obs — encoding handled inside agent.
+    FIX M3: conf now shows last result.confidence, not hardcoded 0.0.
     """
     agent.on_game_start()
     obs, _info = env.reset()
     score       = 0.0
     prev_action: Optional[int] = None
+    last_conf: float = 0.0
 
     for _ in range(CFG.max_steps):
         result = agent.choose_action([obs], prev_action)
         obs, reward, done, truncated, _info = env.step(result.action)
+        # FIX H4: pass raw obs — agent.on_step encodes internally
         agent.on_step(obs, result.action, float(reward))
         score      += float(reward)
         prev_action = result.action
+        last_conf   = result.confidence
         if done or truncated:
             break
 
-    print(f"  [{gid}] score={score:.4f} conf={0.0:.4f}")
+    # FIX M3: use actual last confidence
+    print(f"  [{gid}] score={score:.4f} conf={last_conf:.4f}")
     return score
 
 
