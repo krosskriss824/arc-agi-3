@@ -4,6 +4,7 @@ on:
   push:
     branches:
       - MoonArc3
+  workflow_dispatch:
 
 jobs:
   kaggle-push:
