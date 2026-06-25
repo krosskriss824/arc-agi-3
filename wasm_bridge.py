@@ -261,7 +261,8 @@ def _extract_head_params(model: nn.Module) -> dict[str, torch.Tensor]:
         for k, v in sd.items()
         if any(k.startswith(p) for p in _ADAPTER_HEAD_PREFIXES)
     }
-    assert not [k for k in adapter if not any(k.startswith(p) for p in _ADAPTER_HEAD_PREFIXES)],         f"[_extract_head_params] Invariant violated: unexpected keys in adapter"
+    assert not [k for k in adapter if not any(k.startswith(p) for p in _ADAPTER_HEAD_PREFIXES)], \
+        f"[_extract_head_params] Invariant violated: unexpected keys in adapter"
     return adapter
 
 
@@ -471,7 +472,8 @@ def functional_ttt_train(
 # 9. RHAE STAGE-1 WASM BRIDGE (MoonBit D4-canonical WASM, appended section)
 # =============================================================================
 # Loads rhae_stage1.wasm alongside wasm_bridge.wasm.
-# Interface: _start() initializes MoonBit heap globals; then direct cell-set.
+# Interface: _initialize() (WASI reactor) initializes MoonBit heap globals;
+# fallback: _start() for pure WASM mode; skip if neither exported.
 # Python fallback active when wasmtime unavailable (Kaggle P100 / OFFLINE).
 #
 # Public API consumed by submission_agent.py choose_action():
@@ -561,7 +563,15 @@ def _py_topk(actions: list, k: int) -> list:
 
 class RhaeEngine:
     """Thin Python wrapper around rhae_stage1.wasm.
-    Protocol: _start() initializes heap → write grid cells → call functions.
+
+    MoonBit WASI reactor model exports _initialize (not _start).
+    Bootstrap sequence:
+      1. Try _initialize  — WASI reactor (MoonBit default)
+      2. Try _start       — pure WASM mode fallback
+      3. Skip             — module self-initializes at instantiation
+    Without correct init, heap globals (grid_buf, vis_buf, hash_hi,
+    tt_table, etc.) remain uninitialized → garbage or crash.
+
     Thread-unsafe (single store/instance). Use as process-level singleton.
     """
     __slots__ = ("_store", "_exp", "_wasm_ok")
@@ -579,11 +589,13 @@ class RhaeEngine:
             module = wasmtime.Module(engine, wasm_bytes)
             instance = wasmtime.Instance(self._store, module, [])
             self._exp = instance.exports(self._store)
-            # CRITICAL: call _start to initialize all MoonBit heap globals
-            # (visited_bits, grid_buf, mat_buf, tt_table, etc. are all heap-alloc'd)
-            self._exp["_start"](self._store)
+            # BUG-W1 FIX: MoonBit WASI reactor exports _initialize, not _start.
+            # Safe fallback chain: _initialize → _start → skip (self-init mode).
+            _init = self._exp.get("_initialize") or self._exp.get("_start")
+            if _init is not None:
+                _init(self._store)
             self._wasm_ok = True
-        except Exception as e:
+        except Exception:
             pass  # fallback to pure Python
 
     # -- Grid write helpers --
