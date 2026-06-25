@@ -1,0 +1,31 @@
+name: Push to Kaggle
+
+on:
+  push:
+    branches:
+      - MoonArc3
+
+jobs:
+  kaggle-push:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install Kaggle CLI
+        run: pip install kaggle
+
+      - name: Write kaggle.json
+        run: |
+          mkdir -p ~/.kaggle
+          echo '{"username":"${{ secrets.KAGGLE_USERNAME }}","key":"${{ secrets.KAGGLE_KEY }}"}' > ~/.kaggle/kaggle.json
+          chmod 600 ~/.kaggle/kaggle.json
+
+      - name: Push notebook to Kaggle
+        run: |
+          kaggle kernels push -p kaggle_staging/
