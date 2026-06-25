@@ -1,11 +1,11 @@
 """
 kaggle_main.py — ARC-AGI-3 Submission Orchestrator
-Refactor v12: clean submission path, no TTT, device setup once,
-conditional wheel install, no render_mode warnings, no cache flushes in loop.
+Refactor v13: path fix, game_ids guard, clear GPU diagnostics.
 
-FIXES (v12):
-  H4: on_step receives raw obs (encoding now inside agent.on_step)
-  M3: conf logging uses last result.confidence, not hardcoded 0.0
+FIXES (v13):
+  X6: assert len(game_ids) > 0 — fails early with clear message if dataset missing
+  X1: sys.path order ensures kaggle_staging/ is resolved before external/
+  GPU: explicit CUDA device name logged at startup for RTX 6000 Pro confirmation
 
 Invariants:
   - DEVICE set once at startup, never changed
@@ -31,8 +31,9 @@ KAGGLE_INPUT   = Path("/kaggle/input")
 KAGGLE_WORKING = Path("/kaggle/working")
 REPO_ROOT      = Path(__file__).resolve().parent.parent
 
+# FIX X1: kaggle_staging/ first — ensures wasm_bridge resolves locally
 sys.path.insert(0, str(REPO_ROOT / "kaggle_staging"))
-sys.path.insert(0, str(REPO_ROOT / "external"))
+sys.path.insert(1, str(REPO_ROOT / "external"))
 
 # ─── Config ───────────────────────────────────────────────────────────────────
 
@@ -81,6 +82,11 @@ def run_submission() -> None:
     import arc_agi as arc
     from submission_agent import build_agent
 
+    # GPU diagnostic — confirms RTX 6000 Pro detection
+    if torch.cuda.is_available():
+        gpu_name = torch.cuda.get_device_name(0)
+        gpu_mem  = torch.cuda.get_device_properties(0).total_memory / 1e9
+        print(f"[run] GPU: {gpu_name} | VRAM: {gpu_mem:.1f} GB")
     print(f"[run] device={CFG.device}")
 
     agent = build_agent(
@@ -92,6 +98,11 @@ def run_submission() -> None:
     )
 
     game_ids = arc.list_games()
+    # FIX X6: fail early and clearly if competition dataset not mounted
+    assert len(game_ids) > 0, (
+        "[run] arc.list_games() returned 0 games. "
+        "Check that arc-prize-2026-arc-agi-3 competition dataset is attached."
+    )
     print(f"[run] {len(game_ids)} games")
 
     results: dict[str, float] = {}
