@@ -1,24 +1,28 @@
 """
-wasm_bridge.py — Pure Functional TTT + Adapter I/O
-SOTA refactor v12:
-  - functional_ttt_train: pure param-space gradient descent, no optimizer state
-  - pure_batch_ttt_loss:  fully vectorised, device-derived zero tensors
-  - save_adapter / load_adapter: head-only, action_emb NEVER persisted
-  - encode_grid_numpy: pure NumPy, no tensors
-  - All device references derived from input tensors — zero bare constructors
+wasm_bridge.py — Pure Functional TTT + Adapter I/O + FrameGraphExplorer
+SOTA refactor v19:
+  BUG-TTT-OOB (P0): pure_batch_ttt_loss filters OOB actions before cross_entropy
+  FrameGraphExplorer: graph-based state explorer with dedup + priority tiers
+  volatile_mask: hash stability via volatile pixel zeroing
 
-FIXES (v12):
-  C1: functional_ttt_train uses ONE shared idx per step (not 4 separate randperms)
-  H1: removed imperative in-function .to() calls — device purity restored
+FIXES (v19):
+  TTT-OOB: n_classes from logits.shape[-1]; filter not clamp; zero loss if empty
+  GRAPH:   FrameGraphExplorer ported from Kaggle v18 → canonical GitHub source
+  HASH:    encode_grid_numpy gains volatile_mask param for stable dedup hashing
+
+Previous fixes (v12/v13 retained):
+  C1: functional_ttt_train uses ONE shared idx per step
+  H1: removed imperative in-function .to() calls
   H2: kl_reg_loss / mse_anchor_reg have local fallback implementations
-      so kaggle_staging is self-contained and never crashes on missing external
-  M1: _load_binary uses pathlib.Path.read_bytes() — no resource leak
+  M1: _load_binary uses pathlib.Path.read_bytes()
+  X3: zero-alloc bulk write via _ensure_buf pre-alloc + D4 batch hash
 """
 from __future__ import annotations
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from functools import reduce
 from pathlib import Path
 from typing import Optional
+import collections
 import os
 
 import numpy as np
@@ -64,6 +68,14 @@ except ImportError:
 _TOKEN_LEN: int = 4099
 _HEAD_PREFIXES: tuple[str, ...] = ("action_head.", "value_head.")
 
+# Priority tiers for FrameGraphExplorer
+# Lower number = higher priority = explored first
+_TIER_MOVEMENT: int = 1
+_TIER_SELECT:   int = 2
+_TIER_PUZZLE:   int = 3
+_TIER_UNDO:     int = 4
+_TIER_DEFAULT:  int = 3
+
 
 # ─── Algebraic config ─────────────────────────────────────────────────────────
 
@@ -87,6 +99,7 @@ def encode_grid_numpy(
     grid: np.ndarray,
     action: int = 0,
     n_actions: int = 7,
+    volatile_mask: Optional[np.ndarray] = None,
 ) -> tuple[np.ndarray, int]:
     """
     Encodes a 2-D ARC grid into a fixed-length token vector.
@@ -95,15 +108,223 @@ def encode_grid_numpy(
 
     Layout: [grid_ravel | action | n_actions | 0 | <pad>]
     valid_len = h*w + 3
+
+    volatile_mask (optional, shape == grid.shape):
+        Boolean mask of pixels that change frequently (timers, counters).
+        When provided, those pixels are zeroed BEFORE hashing → stable dedup.
+        Compute via: compute_volatile_mask(frame_history).
     """
-    flat = grid.ravel().astype(np.int32)
+    working = grid.copy()
+    if volatile_mask is not None and volatile_mask.shape == grid.shape:
+        working[volatile_mask] = 0
+
+    flat = working.ravel().astype(np.int32)
     meta = np.array([action, n_actions, 0], dtype=np.int32)
     raw  = np.concatenate([flat, meta])
     tokens = np.pad(raw, (0, max(0, _TOKEN_LEN - len(raw))))[:_TOKEN_LEN]
     return tokens, len(raw)
 
 
-# ─── pure_batch_ttt_loss — fully vectorised ───────────────────────────────────
+def compute_volatile_mask(
+    frame_history: list[np.ndarray],
+    threshold: float = 0.5,
+) -> Optional[np.ndarray]:
+    """
+    Computes a boolean mask of pixels that change more than `threshold`
+    fraction of consecutive frame pairs.
+
+    Returns None if fewer than 2 frames provided (no history to compare).
+    Returns boolean ndarray of same shape as frames.
+
+    Usage:
+        mask = compute_volatile_mask(last_10_grids)
+        tokens, _ = encode_grid_numpy(grid, volatile_mask=mask)
+
+    This is the Go-Explore volatile-status-bar masking technique from
+    samrishtt/arc-agi-3-kaggle-competition (score 0.33).
+    """
+    if len(frame_history) < 2:
+        return None
+    frames = frame_history[-10:]  # last 10 at most
+    h, w   = frames[0].shape
+    change_freq = np.zeros((h, w), dtype=np.float32)
+    for i in range(1, len(frames)):
+        diff = (frames[i] != frames[i - 1]).astype(np.float32)
+        change_freq += diff
+    change_freq /= (len(frames) - 1)
+    return change_freq > threshold
+
+
+# ─── FrameGraphExplorer — v18 graph-based state explorer ─────────────────────
+
+class FrameGraphExplorer:
+    """
+    Graph-based state explorer for ARC-AGI-3.
+
+    Algorithm:
+        state = canonical_hash(current_grid)   [WASM D4-canonical]
+        if state not in graph: register all available actions
+        pick highest-priority unexplored action from current state
+        mark that (state, action) pair as explored
+        if no unexplored actions remain: signal URM fallback
+
+    Priority tiers (lower = higher priority):
+        movement actions  (tag "movement") → tier 1
+        select actions    (tag "select")   → tier 2
+        puzzle actions                      → tier 3
+        undo/reset                         → tier 4
+
+    WIN detection:
+        call on_win(state_hash, action) after each step
+        extract_win_path() returns minimal action list
+
+    Dedup contract:
+        never executes the same action from the same state hash twice
+        across the entire episode (reset on on_episode_reset)
+    """
+
+    def __init__(self) -> None:
+        # graph[state_hash] = set of (priority, action_idx) not yet tried
+        self._graph: dict[int, list[tuple[int, int]]] = {}
+        # parent for win-path extraction: (state_hash → (parent_hash, action))
+        self._parent: dict[int, tuple[int, int]] = {}
+        self._root_hash: Optional[int] = None
+        self._win_path: Optional[list[int]] = None
+        self._n_actions: int = 7
+        self._game_tags: list[str] = []
+        # Per-(state,action) explored set
+        self._explored: set[tuple[int, int]] = set()
+
+    # ── Configuration ─────────────────────────────────────────────────────────
+
+    def set_game_tags(self, tags: list[str]) -> None:
+        """Call BEFORE first choose_action. Sets priority tier mapping."""
+        self._game_tags = [t.lower() for t in tags]
+
+    def update_n_actions(self, n: int) -> None:
+        """Call after every env.step() with len(env.action_space)."""
+        self._n_actions = n
+
+    # ── Episode lifecycle ──────────────────────────────────────────────────────
+
+    def on_episode_reset(self) -> None:
+        """Call at the start of every new game/episode."""
+        self._graph.clear()
+        self._parent.clear()
+        self._explored.clear()
+        self._root_hash = None
+        self._win_path  = None
+
+    # ── Priority assignment ────────────────────────────────────────────────────
+
+    def _action_priority(self, action_idx: int) -> int:
+        """
+        Assigns priority tier to an action index.
+        Heuristic based on game tags and action index position.
+
+        In ARC-AGI-3 the first few actions tend to be directional/movement,
+        middle ones are select/click, last one is undo/reset.
+        Without game tags we use position-based heuristic.
+        """
+        n = self._n_actions
+        if "movement" in self._game_tags:
+            # First n-2 actions are movement
+            if action_idx < max(1, n - 2):
+                return _TIER_MOVEMENT
+        if "select" in self._game_tags:
+            # All non-last actions are select
+            if action_idx < n - 1:
+                return _TIER_SELECT
+        # Default: puzzle-tier for middle actions, undo-tier for last
+        if action_idx == n - 1:
+            return _TIER_UNDO
+        return _TIER_PUZZLE
+
+    # ── Graph management ──────────────────────────────────────────────────────
+
+    def _ensure_node(self, state_hash: int) -> None:
+        """Register all available actions for a new state node."""
+        if state_hash in self._graph:
+            return
+        # Build priority-sorted action list, exclude already explored
+        actions = [
+            (self._action_priority(a), a)
+            for a in range(self._n_actions)
+            if (state_hash, a) not in self._explored
+        ]
+        actions.sort()  # stable sort: priority first, then action index
+        self._graph[state_hash] = actions
+
+    def register_transition(
+        self,
+        from_hash: int,
+        action: int,
+        to_hash: int,
+    ) -> None:
+        """Record (from → action → to) for win-path extraction."""
+        if to_hash not in self._parent:
+            self._parent[to_hash] = (from_hash, action)
+        if self._root_hash is None:
+            self._root_hash = from_hash
+
+    def on_win(self, win_hash: int) -> None:
+        """Call when WIN state detected. Stores win_path."""
+        self._win_path = self._extract_path(win_hash)
+
+    def _extract_path(self, target: int) -> list[int]:
+        """Backtrack parent pointers to extract minimal action sequence."""
+        path: list[int] = []
+        h = target
+        while h in self._parent:
+            parent_h, action = self._parent[h]
+            path.append(action)
+            h = parent_h
+        path.reverse()
+        return path
+
+    def extract_win_path(self) -> Optional[list[int]]:
+        """Returns minimal action list to WIN, or None if not found yet."""
+        return self._win_path
+
+    # ── Core: choose action ────────────────────────────────────────────────────
+
+    def choose_action(
+        self,
+        state_hash: int,
+        parent_hash: Optional[int] = None,
+        parent_action: Optional[int] = None,
+    ) -> Optional[int]:
+        """
+        Returns the highest-priority unexplored action from state_hash.
+        Returns None when all actions from this state are exhausted
+        (signal for URM fallback).
+
+        Registers parent transition for path extraction if provided.
+        """
+        # Record parent for path extraction
+        if parent_hash is not None and parent_action is not None:
+            self.register_transition(parent_hash, parent_action, state_hash)
+
+        self._ensure_node(state_hash)
+        candidates = self._graph[state_hash]
+
+        # Pop first non-explored candidate
+        while candidates:
+            _, action = candidates.pop(0)
+            key = (state_hash, action)
+            if key not in self._explored:
+                self._explored.add(key)
+                return action
+
+        # Frontier exhausted for this state
+        return None
+
+    @property
+    def has_win(self) -> bool:
+        return self._win_path is not None
+
+
+# ─── pure_batch_ttt_loss — fully vectorised + P0 OOB fix ─────────────────────
 
 def pure_batch_ttt_loss(
     params:       dict,
@@ -122,13 +343,41 @@ def pure_batch_ttt_loss(
     Pure functional loss: no optimizer state, no in-place ops.
     Device derived from batch_states.device — zero bare constructors.
     FIX H1: no internal .to() calls — all tensors must arrive on correct device.
+
+    FIX TTT-OOB (P0): cross_entropy crashes when target >= n_classes.
+        Root cause: different games have different n_actions; TTT head may have
+        been initialized with fewer classes than the current action_space size.
+        Fix: derive n_classes from logits.shape[-1] at runtime;
+             filter (not clamp) OOB targets to preserve gradient correctness;
+             return zero loss tensor if all targets are OOB (no valid samples).
     """
     device = batch_states.device
 
     out      = functional_call(model, (params, buffers), (batch_states,))
-    act_loss = F.cross_entropy(out["action_logits"], batch_actions)
-    val_loss = F.mse_loss(value_logits_to_scalar(out["value"]), batch_rewards.float())
-    task_loss = act_loss + val_loss
+    act_logits = out["action_logits"]   # (B, n_classes)
+
+    # ── P0 FIX: filter OOB action targets ────────────────────────────────────
+    n_classes  = act_logits.shape[-1]   # derive at runtime, NOT from config
+    valid_mask = (batch_actions >= 0) & (batch_actions < n_classes)
+
+    if valid_mask.sum() == 0:
+        # All targets OOB — skip action loss for this batch
+        # Value loss still computed to keep model updating
+        val_loss = F.mse_loss(
+            value_logits_to_scalar(out["value"]),
+            batch_rewards.float(),
+        )
+        task_loss = val_loss
+    else:
+        valid_logits  = act_logits[valid_mask]
+        valid_targets = batch_actions[valid_mask]
+        act_loss  = F.cross_entropy(valid_logits, valid_targets)
+        val_loss  = F.mse_loss(
+            value_logits_to_scalar(out["value"]),
+            batch_rewards.float(),
+        )
+        task_loss = act_loss + val_loss
+    # ─────────────────────────────────────────────────────────────────────────
 
     has_anchor = (pre_logits is not None) and (pre_values is not None)
     reg_loss   = (
@@ -165,9 +414,8 @@ def functional_ttt_train(
     Pure functional TTT — returns new params without mutating model.
     Uses torch.func.grad for parameter-space gradients.
 
-    FIX C1: ONE shared idx per step — states/actions/next/rewards are always
-            aligned. Previously 4 separate randperms broke (s,a,r) correspondence.
-    FIX H1: no .to(device) inside — caller is responsible for device placement.
+    FIX C1: ONE shared idx per step — states/actions/next/rewards always aligned.
+    FIX H1: no .to(device) inside — caller responsible for device placement.
 
     Mathematical identity:
         p_{t+1} = p_t - lr * ∇_{p_t} L(p_t)
