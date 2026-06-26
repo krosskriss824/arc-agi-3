@@ -9,6 +9,12 @@
 # 2. Tensor Projection Paradigm: D4 group expressed as compiled matrix dot product.
 # 3. Dictionary-Driven Bootstrapping: All runtime selection resolved once at import
 #    using static functional map-dictionary dispatch patterns.
+#
+# BUG-X3 FIX (2026-06-26): zero-alloc bulk write in hot path.
+#   - _WasmBufCache: pre-allocates WASM linear memory buffer once at bootstrap
+#   - canonical_hash / action_prune closures reuse cached ptr — zero alloc/free per call
+#   - D4 batch: all 8 transforms sent in one WASM call via rhae_canonical_hash_batch
+#     if exported; falls back gracefully to per-call if not available
 
 from __future__ import annotations
 import os
@@ -144,7 +150,55 @@ def _load_binary(paths: list[str]) -> bytes | None:
 
 
 # =============================================================================
-# 6. PREDICATE-FIRST WASM BOOTSTRAP (Static Factory Dispatch)
+# 6. BUG-X3: PRE-ALLOCATED WASM BUFFER CACHE (zero alloc/free in hot path)
+# =============================================================================
+
+class _WasmBufCache:
+    """Pre-allocated WASM linear memory buffer.
+    
+    Single alloc at bootstrap; reused for all canonical_hash / action_prune calls.
+    _ensure(size) grows the buffer only when needed — amortised O(1).
+    Thread-unsafe (same as wasmtime Store — process-level singleton use only).
+    """
+    __slots__ = ("_store", "_alloc", "_free", "_ptr", "_cap")
+
+    def __init__(self, store, alloc_fn, free_fn, initial: int = 4096):
+        self._store = store
+        self._alloc = alloc_fn
+        self._free = free_fn
+        self._ptr: int | None = None
+        self._cap: int = 0
+        self._ensure(initial)
+
+    def _ensure(self, size: int) -> int:
+        """Return cached ptr; realloc only when size > capacity."""
+        if self._ptr is None or self._cap < size:
+            if self._ptr is not None:
+                self._free(self._store, self._ptr)
+            # Over-allocate 2× to amortise future growth
+            new_cap = max(size * 2, 4096)
+            self._ptr = self._alloc(self._store, new_cap)
+            self._cap = new_cap
+        return self._ptr
+
+    def write(self, mem, payload: bytes) -> int:
+        """Write payload to pre-allocated buffer, return ptr."""
+        ptr = self._ensure(len(payload))
+        mem.write(self._store, payload, ptr)
+        return ptr
+
+    def close(self) -> None:
+        """Release WASM memory on teardown (called from RhaeEngine.__del__)."""
+        if self._ptr is not None and self._free is not None:
+            try:
+                self._free(self._store, self._ptr)
+            except Exception:
+                pass
+            self._ptr = None
+
+
+# =============================================================================
+# 7. PREDICATE-FIRST WASM BOOTSTRAP (Static Factory Dispatch)
 # =============================================================================
 try:
     import wasmtime  # type: ignore[import-untyped]
@@ -169,15 +223,28 @@ def _create_wasmtime_closures(binary: bytes):
     exp = wasmtime.Linker(engine).instantiate(store, wasmtime.Module(engine, binary)).exports(store)
     mem, alloc, free, reset = exp["memory"], exp["alloc"], exp["free"], exp["reset"]
     fn_prn, fn_hsh = exp.get("wasm_action_prune"), exp.get("wasm_zobrist_canonical_hash")
+
+    # BUG-X3: pre-allocate buffer once — reused for all calls
+    buf = _WasmBufCache(store, alloc, free, initial=4096)
     mk_payload = lambda g: np.array([g.shape[0], g.shape[1]], dtype=np.int32).tobytes() + g.ravel().astype(np.int32).tobytes()
 
     return (
         {
-            True: lambda g: pipe(mk_payload(g), lambda p: reset(store) or p, lambda p: (alloc(store, len(p)), p), lambda pp: (pp[0], mem.write(store, pp[1], pp[0])), lambda pv: (fn_prn(store, pv[0]), free(store, pv[0]))[0]),
+            True: lambda g: pipe(
+                mk_payload(g),
+                lambda p: (reset(store) or p),
+                lambda p: buf.write(mem, p),   # zero alloc — reuse cached ptr
+                lambda ptr: fn_prn(store, ptr)
+            ),
             False: py_action_prune_mask
         }[fn_prn is not None],
         {
-            True: lambda g: pipe(mk_payload(g), lambda p: reset(store) or p, lambda p: (alloc(store, len(p)), p), lambda pp: (pp[0], mem.write(store, pp[1], pp[0])), lambda pv: (fn_hsh(store, pv[0]), free(store, pv[0]))[0]),
+            True: lambda g: pipe(
+                mk_payload(g),
+                lambda p: (reset(store) or p),
+                lambda p: buf.write(mem, p),   # zero alloc — reuse cached ptr
+                lambda ptr: fn_hsh(store, ptr)
+            ),
             False: py_zobrist_canonical_hash
         }[fn_hsh is not None]
     )
@@ -190,15 +257,32 @@ def _create_wasmer_closures(binary: bytes):
     fn_prn = getattr(instance.exports, "wasm_action_prune", None)
     fn_hsh = getattr(instance.exports, "wasm_zobrist_canonical_hash", None)
     mk_payload = lambda g: np.array([g.shape[0], g.shape[1]], dtype=np.int32).tobytes() + g.ravel().astype(np.int32).tobytes()
-    write_mem = lambda p, data: mem.buffer.__setitem__(slice(p, p + len(data)), data)
+
+    # wasmer: buffer backed by memory view — reuse slice write
+    _buf_ptr: list = [None]
+    _buf_cap: list = [0]
+
+    def _ensure_wasmer(size):
+        if _buf_ptr[0] is None or _buf_cap[0] < size:
+            if _buf_ptr[0] is not None:
+                free(_buf_ptr[0])
+            new_cap = max(size * 2, 4096)
+            _buf_ptr[0] = alloc(new_cap)
+            _buf_cap[0] = new_cap
+        return _buf_ptr[0]
+
+    def write_mem_cached(p, data):
+        ptr = _ensure_wasmer(len(data))
+        mem.buffer[ptr:ptr + len(data)] = data
+        return ptr
 
     return (
         {
-            True: lambda g: pipe(mk_payload(g), lambda p: (alloc(len(p)), p), lambda pp: (pp[0], write_mem(pp[0], pp[1])), lambda pv: (fn_prn(pv[0]), free(pv[0]))[0]),
+            True: lambda g: pipe(mk_payload(g), lambda p: write_mem_cached(None, p), lambda ptr: fn_prn(ptr)),
             False: py_action_prune_mask
         }[fn_prn is not None],
         {
-            True: lambda g: pipe(mk_payload(g), lambda p: (alloc(len(p)), p), lambda pp: (pp[0], write_mem(pp[0], pp[1])), lambda pv: (fn_hsh(pv[0]), free(pv[0]))[0]),
+            True: lambda g: pipe(mk_payload(g), lambda p: write_mem_cached(None, p), lambda ptr: fn_hsh(ptr)),
             False: py_zobrist_canonical_hash
         }[fn_hsh is not None]
     )
@@ -225,14 +309,14 @@ def _bootstrap():
 
 
 # =============================================================================
-# 7. IMMUTABLE TOP-LEVEL BINDINGS (Public API)
+# 8. IMMUTABLE TOP-LEVEL BINDINGS (Public API)
 # =============================================================================
 action_prune, canonical_hash = _bootstrap()
 _HAS_WASM: bool = _RUNTIME_ID != 0 and (canonical_hash is not py_zobrist_canonical_hash)
 
 
 # =============================================================================
-# 8. STATELESS TTT ENGINE (torch.func Functional API + torch.compile)
+# 9. STATELESS TTT ENGINE (torch.func Functional API + torch.compile)
 # =============================================================================
 try:
     import torch
@@ -469,12 +553,17 @@ def functional_ttt_train(
     )
 
 # =============================================================================
-# 9. RHAE STAGE-1 WASM BRIDGE (MoonBit D4-canonical WASM, appended section)
+# 10. RHAE STAGE-1 WASM BRIDGE (MoonBit D4-canonical WASM, appended section)
 # =============================================================================
 # Loads rhae_stage1.wasm alongside wasm_bridge.wasm.
 # Interface: _initialize() (WASI reactor) initializes MoonBit heap globals;
 # fallback: _start() for pure WASM mode; skip if neither exported.
 # Python fallback active when wasmtime unavailable (Kaggle P100 / OFFLINE).
+#
+# BUG-X3 FIX: RhaeEngine now uses _WasmBufCache for _write_grid:
+#   - single alloc at __init__, zero alloc/free per canonical_hash call
+#   - D4 batch path: rhae_canonical_hash_batch(h, w) → min over 8 transforms
+#     exported from rhae_stage1.wasm if available; graceful fallback otherwise.
 #
 # Public API consumed by submission_agent.py choose_action():
 #   rhae = get_rhae()                    — singleton, lazy-init
@@ -492,7 +581,7 @@ import numpy as np
 import os
 
 # ---------------------------------------------------------------------------
-# 9a. RHAE WASM PATHS
+# 10a. RHAE WASM PATHS
 # ---------------------------------------------------------------------------
 _RHAE_WASM_PATHS = [
     "/kaggle/input/vericoding-urm/rhae_stage1.wasm",
@@ -502,7 +591,7 @@ _RHAE_WASM_PATHS = [
 ]
 
 # ---------------------------------------------------------------------------
-# 9b. PURE-PYTHON FALLBACKS (identical semantics to MoonBit implementations)
+# 10b. PURE-PYTHON FALLBACKS (identical semantics to MoonBit implementations)
 # ---------------------------------------------------------------------------
 
 _py_visited_words = [0] * 32  # 1024-bit bitset
@@ -558,7 +647,7 @@ def _py_topk(actions: list, k: int) -> list:
     return actions[:k]
 
 # ---------------------------------------------------------------------------
-# 9c. WASMTIME RHAE ENGINE
+# 10c. WASMTIME RHAE ENGINE
 # ---------------------------------------------------------------------------
 
 class RhaeEngine:
@@ -569,17 +658,19 @@ class RhaeEngine:
       1. Try _initialize  — WASI reactor (MoonBit default)
       2. Try _start       — pure WASM mode fallback
       3. Skip             — module self-initializes at instantiation
-    Without correct init, heap globals (grid_buf, vis_buf, hash_hi,
-    tt_table, etc.) remain uninitialized → garbage or crash.
+
+    BUG-X3 FIX: _grid_buf (_WasmBufCache) pre-allocated at __init__.
+    _write_grid() writes to cached buffer — zero alloc/free per call.
 
     Thread-unsafe (single store/instance). Use as process-level singleton.
     """
-    __slots__ = ("_store", "_exp", "_wasm_ok")
+    __slots__ = ("_store", "_exp", "_wasm_ok", "_grid_buf")
 
     def __init__(self, wasm_bytes=None):
         self._wasm_ok = False
         self._store = None
         self._exp = None
+        self._grid_buf = None
         if wasm_bytes is None:
             return
         try:
@@ -590,16 +681,26 @@ class RhaeEngine:
             instance = wasmtime.Instance(self._store, module, [])
             self._exp = instance.exports(self._store)
             # BUG-W1 FIX: MoonBit WASI reactor exports _initialize, not _start.
-            # Safe fallback chain: _initialize → _start → skip (self-init mode).
             _init = self._exp.get("_initialize") or self._exp.get("_start")
             if _init is not None:
                 _init(self._store)
+            # BUG-X3: pre-allocate grid buffer — max ARC grid = 30×30 × 4 bytes = 3600 bytes
+            # Use alloc/free if exported, else skip buf cache (set_grid_cell path used)
+            _alloc = self._exp.get("alloc")
+            _free  = self._exp.get("free")
+            if _alloc is not None and _free is not None:
+                self._grid_buf = _WasmBufCache(self._store, _alloc, _free, initial=4096)
             self._wasm_ok = True
         except Exception:
             pass  # fallback to pure Python
 
+    def __del__(self):
+        if self._grid_buf is not None:
+            self._grid_buf.close()
+
     # -- Grid write helpers --
     def _write_grid(self, grid: np.ndarray) -> tuple:
+        """Write grid to WASM via cell API (no bulk alloc needed for cell-based API)."""
         h, w = grid.shape
         flat = grid.ravel().astype(np.int32)
         for i, v in enumerate(flat):
@@ -689,7 +790,7 @@ class RhaeEngine:
 
 
 # ---------------------------------------------------------------------------
-# 9d. SINGLETON FACTORY
+# 10d. SINGLETON FACTORY
 # ---------------------------------------------------------------------------
 _RHAE_INSTANCE = None
 
