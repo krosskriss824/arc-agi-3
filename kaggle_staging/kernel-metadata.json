@@ -1,11 +1,12 @@
 {
   "id": "krisskey/arc3-urm-ttt-training-v12-rhae-wasm",
-  "title": "ARC3 URM TTT Training v12 RHAE WASM",
+  "title": "ARC3 URM TTT Training v16 RHAE WASM",
   "code_file": "kaggle_main.py",
   "language": "python",
   "kernel_type": "script",
   "is_private": "true",
   "enable_gpu": "true",
+  "accelerator": "nvidiaTeslaT4",
   "enable_internet": "false",
   "dataset_sources": ["krisskey/vericoding-urm"],
   "competition_sources": ["arc-prize-2026-arc-agi-3"],
