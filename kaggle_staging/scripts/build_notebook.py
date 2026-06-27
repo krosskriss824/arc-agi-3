@@ -84,9 +84,9 @@ for p in [str(WK), str(WK/"external"), str(WK/"external"/"urm")]:
 os.chdir(WK)
 print("Setup OK")
 
-# Pre-import strategy cache type (used later)
+# Strategy cache type (persists across all games)
 import game_profiler as _gp
-import dense_explorer as _de
+_strategy_cache = _gp.StrategyCache()
 
 # ── Install wasmtime offline from dataset wheel ──
 try:
@@ -234,9 +234,6 @@ def extract_grid(frame):
 # Pre-allocate FrameProcessor for counter mask detection
 _fp_counter = FrameProcessor()
 
-# Strategy cache (persists across all games in a run)
-_cache = _gp.StrategyCache()
-
 for idx, env_info in enumerate(env_infos):
     gid = str(getattr(env_info, "game_id", getattr(env_info, "id", idx)))
     env = None; sbuf, abuf, rbuf = [], [], []; score = 0.0
@@ -249,6 +246,7 @@ for idx, env_info in enumerate(env_infos):
         agent.on_game_start()
 
         # ── v23: Game Profiler + DenseExplorer + StrategyCache ──
+        import dense_explorer as _de
         _act_list = list(getattr(env, "action_space", []))
         if not _act_list:
             _act_list = [_GE.GameAction.ACTION1, _GE.GameAction.ACTION2,
@@ -260,7 +258,7 @@ for idx, env_info in enumerate(env_infos):
         
         # Profile game
         _prof = _gp.profile_game(env)
-        _strategy = _gp.choose_solver(_prof, cache=_cache)
+        _strategy = _gp.choose_solver(_prof, cache=_strategy_cache)
         _sig = _gp.compute_signature(_prof)
         print(f"  [{idx+1}] {gid}: {_strategy['name']} (n={_prof.n_actions}, "
               f"c={_prof.has_complex}, lc={_prof.live_click_found}, "
@@ -277,7 +275,10 @@ for idx, env_info in enumerate(env_infos):
                 _ga = _act_list[_a_idx]
                 for _k in range(_strategy["max_steps"]):
                     _gd = {"x": 32, "y": 32} if _ga.is_complex() else None
-                    _nf = env.step(_ga, data=_gd)
+                    try:
+                        _nf = env.step(_ga, data=_gd)
+                    except (KeyError, TypeError, AttributeError):
+                        _nf = env.step(_ga)
                     if _nf is None: break
                     if getattr(_nf, "state", None) is _GS.WIN:
                         _solved = True; _solution = [_a_idx] * (_k + 1)
@@ -328,7 +329,7 @@ for idx, env_info in enumerate(env_infos):
             game_scores[gid] = score
             bfs_results[gid] = {"solved": True, "n_actions": len(_solution), "solver": _strategy['name']}
             _best_score = max(_best_score, score)
-            _cache.store(_sig, _strategy["name"], True, len(_solution))
+            _strategy_cache.store(_sig, _strategy["name"], True, len(_solution))
             continue  # solved, skip agent loop
         
         # Fallback: agent loop (unchanged)
@@ -346,7 +347,10 @@ for idx, env_info in enumerate(env_infos):
                         tok = wm.encode_state(grid, _aid)
                         sbuf.append(tok.squeeze(0).cpu().numpy().astype(np.int32))
                         abuf.append(_aid); rbuf.append(0.0)
-                nf = env.step(act, data=_act_data)
+                try:
+                    nf = env.step(act, data=_act_data)
+                except (KeyError, TypeError, AttributeError):
+                    nf = env.step(act)
                 if nf is None: break
                 r_ = float(getattr(nf, "levels_completed", 0) - getattr(frame, "levels_completed", 0))
                 score += r_

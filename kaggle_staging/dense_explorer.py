@@ -1,12 +1,10 @@
-"""dense_explorer.py — Dense click scan (32×2=1024 pos) + hybrid live-click BFS.
+"""dense_explorer.py — Dense click scan (32×2=1024 pos) + Replay BFS.
 
 Architecture:
-  Phase 1: Simple action brute (200 per action, shared budget)
+  Phase 1: Simple action brute (200 per action)
   Phase 2: Dense click scan (1024 positions, stride=2)
-  Phase 3: Live click follow-up (BFS from live clicks)
-  Phase 4: Fallback to segment-based GraphExplorer (if live clicks found)
-  
-Merges Occam 57.60% RHAE dense scan + just-explore 17/25 segment approach.
+  Phase 3: Replay BFS from live clicks (reset-replay frontier)
+  Phase 4: 1px refinement around unique live click states
 """
 import numpy as np
 from collections import deque
@@ -32,11 +30,8 @@ _ALL_POSITIONS = [(x, y) for y in range(0, 64, 2) for x in range(0, 64, 2)]
 
 
 class DenseExplorer:
-    """Explorer that tries 1024 click positions to find state changes.
-    
-    Hybrid: dense scan → segment-based GraphExplorer if live clicks found.
-    """
-    
+    """Explorer: dense scan → replay BFS from live clicks."""
+
     def __init__(self, env, action_list, fp=None, hasher=None):
         self._env = env
         self._actions = action_list
@@ -48,13 +43,35 @@ class DenseExplorer:
         self._total_steps = 0
         self.solution = None
         self.live_clicks = []  # [(x, y, state_hash), ...]
-    
-    def _step(self, action_idx, cx=32, cy=32):
+        self._api_supports_data = True
+
+        # ── Smoke test: detect if env.step(ga, data=dict) works ──
+        self._test_action6()
+
+    def _test_action6(self):
+        """Detect click API support. Sets _api_supports_data flag."""
+        if self._click_idx is None:
+            return
+        ga = self._actions[self._click_idx]
+        try:
+            _ = self._env.step(ga, data={"x": 32, "y": 32})
+            self._api_supports_data = True
+        except (KeyError, TypeError, AttributeError):
+            self._api_supports_data = False
+
+    def _safe_step(self, action_idx, cx=32, cy=32):
+        """Safe step: tries data=dict, falls back to bare step."""
         self._total_steps += 1
         ga = self._actions[action_idx]
-        gd = {"x": cx, "y": cy} if ga.is_complex() else None
-        return self._env.step(ga, data=gd)
-    
+        if not ga.is_complex():
+            return self._env.step(ga)
+        if self._api_supports_data:
+            try:
+                return self._env.step(ga, data={"x": int(cx), "y": int(cy)})
+            except (KeyError, TypeError, AttributeError):
+                self._api_supports_data = False
+        return self._env.step(ga)  # bare step without click coords
+
     # ── Phase 1: Simple action brute ──
     def _phase1_simple_brute(self, budget):
         """Try each simple action repeatedly up to budget."""
@@ -62,9 +79,8 @@ class DenseExplorer:
             if self._total_steps >= budget:
                 return None
             self._env.reset()
-            ga = self._actions[aidx]
             for _k in range(200):
-                nf = self._step(aidx)
+                nf = self._safe_step(aidx)
                 if nf is None:
                     break
                 if _is_win(nf):
@@ -72,129 +88,154 @@ class DenseExplorer:
                 if self._total_steps >= budget:
                     break
         return None
-    
+
     # ── Phase 2: Dense click scan (1024 positions, stride=2) ──
     def _phase2_dense_scan(self, max_positions=1024):
-        """Try every click position. Return solution or list of live clicks.
-        
-        Live click = click position that produces state diff vs baseline.
-        """
+        """Try every click position. Return solution or list of live clicks."""
         live_clicks = []
-        
+
         # Baseline: state after reset + first step
         self._env.reset()
-        _bf = self._step(0)
+        _bf = self._safe_step(0)
         _bg = _get_grid(_bf)
         baseline_hash = _grid_hash(_bg)
-        
+
         for pi, (px, py) in enumerate(_ALL_POSITIONS):
             if pi >= max_positions or self._total_steps >= self._budget:
                 break
-            
             self._env.reset()
-            nf = self._step(self._click_idx, px, py)
+            nf = self._safe_step(self._click_idx, px, py)
             if nf is None:
                 continue
-            
             if _is_win(nf):
                 self.solution = [self._click_idx]
                 return "WIN", [(px, py, None)]
-            
             grid = _get_grid(nf)
             h = _grid_hash(grid)
             if h != baseline_hash:
                 live_clicks.append((px, py, h))
-        
         return "LIVE_CLICKS" if live_clicks else "NO_LIVE", live_clicks
-    
-    # ── Phase 3: Follow-up on live clicks ──
-    def _phase3_followup(self, live_clicks, follow_budget):
-        """From each live click state, try sequences: click + simple + click."""
-        # Deduplicate by state hash (max 10 unique live states)
-        seen = set()
-        unique_clicks = []
-        for px, py, h in live_clicks:
-            if h not in seen and len(unique_clicks) < 10:
-                seen.add(h)
-                unique_clicks.append((px, py, h))
+
+    # ── Phase 3: Replay BFS from live clicks (Occam-style) ──
+    def _replay_bfs(self, live_clicks, max_steps):
+        """Reset-replay BFS: env.reset() → replay prefix → try all actions.
         
-        for px, py, h in unique_clicks:
+        Live clicks form initial frontier nodes. Each node has a replay prefix
+        (list of action tuples). Separated replay budget (avoids spending
+        exploration steps on reconstruction).
+        """
+        if not live_clicks:
+            return False
+        
+        # Deduplicate live clicks by state hash
+        seen = set()
+        frontier_nodes = []  # each: (state_hash, prefix: list[(aidx, cx, cy)])
+        for px, py, h in live_clicks:
+            if h not in seen:
+                seen.add(h)
+                frontier_nodes.append((h, [(self._click_idx, px, py)]))
+        
+        explored = set(seen)
+        _replay_budget = max_steps  # steps allowed for replay
+        
+        while frontier_nodes and self._total_steps < self._budget:
+            # BFS: pop shortest prefix first
+            frontier_nodes.sort(key=lambda n: len(n[1]))
+            cur_hash, prefix = frontier_nodes.pop(0)
+            
+            # Replay prefix to reach this state
+            if not self._replay_prefix(prefix):
+                continue
+            
+            # Try all actions from this state
+            for aidx in range(len(self._actions)):
+                if self._total_steps >= self._budget:
+                    return self.solution is not None
+                nf = self._safe_step(aidx)
+                if nf is None:
+                    continue
+                if _is_win(nf):
+                    self.solution = [a for a, _, _ in prefix] + [aidx]
+                    return True
+                ng = _get_grid(nf)
+                nh = _grid_hash(ng)
+                if nh not in explored:
+                    explored.add(nh)
+                    frontier_nodes.append((nh, list(prefix) + [(aidx, -1, -1)]))
+            
+            # Also try click at each known live click position
+            if self._click_idx is not None:
+                for lcx, lcy, _ in live_clicks[:10]:
+                    if self._total_steps >= self._budget:
+                        break
+                    nf = self._safe_step(self._click_idx, lcx, lcy)
+                    if nf is None:
+                        continue
+                    if _is_win(nf):
+                        self.solution = [a for a, _, _ in prefix] + [self._click_idx]
+                        return True
+                    ng = _get_grid(nf)
+                    nh = _grid_hash(ng)
+                    if nh not in explored:
+                        explored.add(nh)
+                        frontier_nodes.append((nh, list(prefix) + [(self._click_idx, lcx, lcy)]))
+        
+        return self.solution is not None
+    
+    def _replay_prefix(self, prefix):
+        """env.reset() → step through prefix actions. Returns True if all steps succeeded."""
+        self._env.reset()
+        for aidx, cx, cy in prefix:
+            nf = self._safe_step(aidx, cx, cy)
+            if nf is None:
+                return False
+        return True
+
+    # ── Phase 4: 1px refinement ──
+    def _refine_live_clicks(self, live_clicks):
+        """Try ±3px around unique live click centers."""
+        seen = set()
+        unique_centers = []
+        for px, py, h in live_clicks:
+            if h not in seen and len(unique_centers) < 5:
+                seen.add(h)
+                unique_centers.append((px, py))
+        for px, py in unique_centers:
             if self._total_steps >= self._budget:
                 break
-            
-            # Strategy A: click → simple actions repeated
-            for aidx in self._simple_indices:
-                if self._total_steps >= self._budget:
-                    break
-                self._env.reset()
-                nf1 = self._step(self._click_idx, px, py)
-                if nf1 is None: continue
-                if _is_win(nf1):
-                    self.solution = [self._click_idx]
-                    return True
-                for _k in range(follow_budget):
-                    nf2 = self._step(aidx)
-                    if nf2 is None: break
-                    if _is_win(nf2):
-                        self.solution = [self._click_idx] + [aidx] * (_k + 1)
-                        return True
-            
-            # Strategy B: click → click (try other live clicks from this state)
-            for px2, py2, _ in live_clicks[:20]:
-                if self._total_steps >= self._budget:
-                    break
-                if px2 == px and py2 == py: continue
-                self._env.reset()
-                self._step(self._click_idx, px, py)
-                nf2 = self._step(self._click_idx, px2, py2)
-                if nf2 is None: continue
-                if _is_win(nf2):
-                    self.solution = [self._click_idx, self._click_idx]
-                    return True
-            
-            # Strategy C: click → simple ×5 → click ×5 (cycle)
-            self._env.reset()
-            self._step(self._click_idx, px, py)
-            for _cycle in range(5):
-                if self._total_steps >= self._budget:
-                    break
-                for aidx in self._simple_indices[:2]:  # try first 2 simple
-                    nf = self._step(aidx)
-                    if nf is None: break
+            for ox in range(-3, 4):
+                for oy in range(-3, 4):
+                    if self._total_steps >= self._budget:
+                        break
+                    nx = max(0, min(63, px + ox))
+                    ny = max(0, min(63, py + oy))
+                    self._env.reset()
+                    nf = self._safe_step(self._click_idx, nx, ny)
+                    if nf is None:
+                        continue
                     if _is_win(nf):
                         self.solution = [self._click_idx]
                         return True
-                for px2, py2, _ in unique_clicks[:3]:
-                    nf = self._step(self._click_idx, px2, py2)
-                    if nf is None: break
-                    if _is_win(nf):
-                        self.solution = [self._click_idx]
-                        return True
-        
         return False
-    
+
     # ── Main entry ──
     def explore(self, max_steps=2000, dense_scan_first=True):
         """Main loop. Returns True if solution found.
-        
-        Strategy:
-          1. Simple action brute (200 per action)
-          2. Dense click scan (1024 positions)
-          3. Follow-up on live clicks
-          4. Fallback: segment-based (via external)
+
+        Pipeline: simple brute → dense scan → replay BFS → refinement
         """
         self._budget = max_steps
         self._total_steps = 0
         self.solution = None
         self.live_clicks = []
-        
+
         # Phase 1: Simple action brute
         if self._simple_indices:
             sol = self._phase1_simple_brute(max_steps)
             if sol:
                 self.solution = sol
                 return True
-        
+
         # Phase 2: Dense click scan
         if self._click_idx is not None and self._total_steps < self._budget:
             result, data = self._phase2_dense_scan(1024)
@@ -202,35 +243,15 @@ class DenseExplorer:
                 return True
             if result == "LIVE_CLICKS":
                 self.live_clicks = data
-        
-        # Phase 3: Follow-up on live clicks
+
+        # Phase 3: Replay BFS from live clicks
         if self.live_clicks and self._total_steps < self._budget:
-            self._phase3_followup(self.live_clicks, max_steps // 10)
+            self._replay_bfs(self.live_clicks, max_steps // 2)
             if self.solution:
                 return True
-        
-        # Phase 4: 1px refinement around unique live clicks (catch odd coords)
-        if self.live_clicks and self._total_steps < self._budget:
-            seen = set()
-            unique_live = []
-            for px, py, h in self.live_clicks:
-                if h not in seen and len(unique_live) < 5:
-                    seen.add(h)
-                    unique_live.append((px, py))
-            for px, py in unique_live:
-                if self._total_steps >= self._budget:
-                    break
-                for ox in range(-3, 4):
-                    for oy in range(-3, 4):
-                        if self._total_steps >= self._budget:
-                            break
-                        nx = max(0, min(63, px + ox))
-                        ny = max(0, min(63, py + oy))
-                        self._env.reset()
-                        nf = self._step(self._click_idx, nx, ny)
-                        if nf is None: continue
-                        if _is_win(nf):
-                            self.solution = [self._click_idx]
-                            return True
-        
+
+        # Phase 4: 1px refinement
+        if not self.solution and self.live_clicks and self._total_steps < self._budget:
+            self._refine_live_clicks(self.live_clicks)
+
         return self.solution is not None

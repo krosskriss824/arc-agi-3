@@ -69,6 +69,18 @@ def _is_win(frame):
     s = getattr(frame, "state", None)
     return s is not None and "WIN" in str(s)
 
+
+def _safe_env_step(env, action, cx=32, cy=32):
+    """env.step() with KeyError 'x' fallback for Kaggle arcengine compat."""
+    try:
+        if action.is_complex():
+            return env.step(action, data={"x": int(cx), "y": int(cy)})
+        return env.step(action)
+    except (KeyError, TypeError, AttributeError):
+        # Kaggle arcengine: data kwarg not supported, fall back to bare step
+        return env.step(action)
+
+
 # ── Profiler ──
 
 def profile_game(env):
@@ -94,13 +106,13 @@ def profile_game(env):
     # ── Step 0.5: Quick live-click probe (5 positions, 5 steps) ──
     if prof.has_complex:
         env.reset()
-        _baseline = env.step(actions[0])
+        _baseline = _safe_env_step(env, actions[0])
         _bg = _get_grid(_baseline)
         _bh = hash(_bg.tobytes()) if _bg is not None else -1
         _ca = actions[prof.click_actions[0]]
         for _px, _py in [(32,32), (16,16), (48,48), (16,48), (48,16)]:
             env.reset()
-            _f = env.step(_ca, data={"x": _px, "y": _py})
+            _f = _safe_env_step(env, _ca, _px, _py)
             _g = _get_grid(_f)
             _h = hash(_g.tobytes()) if _g is not None else -1
             if _h != _bh and _h != -1:
@@ -111,18 +123,18 @@ def profile_game(env):
     h_after_one = {}
     for i, a in enumerate(actions):
         env.reset()
-        f1 = env.step(a, data={"x": 32, "y": 32} if a.is_complex() else None)
+        f1 = _safe_env_step(env, a, 32, 32)
         g1 = _get_grid(f1)
         h_after_one[i] = hash(g1.tobytes()) if g1 is not None else -1
         if f1 and _is_win(f1):
             prof.repeated_win.append(i)
 
     # ── Step 2: Dead action detection (no state change) ──
-    init_grid = _get_grid(env.step(actions[0]))
+    init_grid = _get_grid(_safe_env_step(env, actions[0]))
     init_h = hash(init_grid.tobytes()) if init_grid is not None else -1
     for i, a in enumerate(actions):
         env.reset()
-        fa = env.step(a, data={"x": 32, "y": 32} if a.is_complex() else None)
+        fa = _safe_env_step(env, a, 32, 32)
         ga = _get_grid(fa)
         ha = hash(ga.tobytes()) if ga is not None else -1
         if ha == init_h or ha == -1:
@@ -133,8 +145,8 @@ def profile_game(env):
     # ── Step 3: Idempotence (a² == a) ──
     for i, a in enumerate(actions):
         env.reset()
-        env.step(a, data={"x": 32, "y": 32} if a.is_complex() else None)
-        f2 = env.step(a, data={"x": 32, "y": 32} if a.is_complex() else None)
+        _safe_env_step(env, a, 32, 32)
+        f2 = _safe_env_step(env, a, 32, 32)
         g2 = _get_grid(f2)
         h2a = hash(g2.tobytes()) if g2 is not None else -1
         if h2a == h_after_one.get(i) and h2a != -1:
@@ -143,15 +155,15 @@ def profile_game(env):
     # ── Step 4: Absorbing (b∘a == a for all b) ──
     for i in prof.state_changers:
         env.reset()
-        fa = env.step(actions[i], data={"x": 32, "y": 32} if actions[i].is_complex() else None)
+        fa = _safe_env_step(env, actions[i], 32, 32)
         ga = _get_grid(fa)
         ha = hash(ga.tobytes()) if ga is not None else -1
         all_absorb = True
         for j in range(prof.n_actions):
             if i == j: continue
             env.reset()
-            env.step(actions[j], data={"x": 32, "y": 32} if actions[j].is_complex() else None)
-            fb = env.step(actions[i], data={"x": 32, "y": 32} if actions[i].is_complex() else None)
+            _safe_env_step(env, actions[j], 32, 32)
+            fb = _safe_env_step(env, actions[i], 32, 32)
             gb = _get_grid(fb)
             hb = hash(gb.tobytes()) if gb is not None else -1
             if hb != ha:
@@ -160,13 +172,13 @@ def profile_game(env):
         if all_absorb:
             prof.absorbing.append(i)
 
-    # ── Step 5: Repeated win (up to 100 per action, max total 300) ──
+    # ── Step 5: Repeated win ──
     _budget = min(300, 100 * prof.n_actions)
     for i, a in enumerate(actions):
         if _budget <= 0: break
         env.reset()
         for k in range(1, min(100, _budget // max(1, prof.n_actions - i)) + 1):
-            _nf = env.step(a, data={"x": 32, "y": 32} if a.is_complex() else None)
+            _nf = _safe_env_step(env, a, 32, 32)
             if _nf is not None and _is_win(_nf):
                 prof.repeated_win.append(i)
                 break
@@ -288,8 +300,7 @@ def solve_repeated_action(env, strategy, act_list):
         env.reset()
         _ga = act_list[_a_idx]
         for _k in range(strategy["max_steps"]):
-            _gd = {"x": 32, "y": 32} if _ga.is_complex() else None
-            _nf = env.step(_ga, data=_gd)
+            _nf = _safe_env_step(env, _ga, 32, 32)
             if _nf is None: break
             if _is_win(_nf):
                 return [_a_idx] * (_k + 1)

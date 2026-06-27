@@ -88,17 +88,20 @@ class GraphExplorer:
         prefix = self._prefix.get(to_hash, [])
         self._env.reset()
         for aidx, cx, cy in prefix:
-            ga = self._actions[aidx]
-            gd = {"x": cx, "y": cy} if ga.is_complex() else None
-            nf = self._env.step(ga, data=gd)
+            nf = self._safe_step(aidx, cx, cy)
             if nf is None:
                 break
 
-    def _step(self, action_idx, cx=32, cy=32):
+    def _safe_step(self, action_idx, cx=32, cy=32):
+        """Step with KeyError 'x' fallback for Kaggle arcengine compat."""
         self._total_steps += 1
         ga = self._actions[action_idx]
-        gd = {"x": cx, "y": cy} if ga.is_complex() else None
-        return self._env.step(ga, data=gd)
+        try:
+            if ga.is_complex():
+                return self._env.step(ga, data={"x": int(cx), "y": int(cy)})
+            return self._env.step(ga)
+        except (KeyError, TypeError, AttributeError):
+            return self._env.step(ga)
 
     def _is_win(self, frame):
         s = getattr(frame, "state", None)
@@ -241,7 +244,7 @@ class GraphExplorer:
         self.solution = None
 
         self._env.reset()
-        frame = self._step(0)
+        frame = self._safe_step(0)
         if frame is None:
             return False
         grid = self._get_grid(frame)
@@ -265,7 +268,7 @@ class GraphExplorer:
                 self._global_tried.clear()
                 self._prefix.clear()
                 self._env.reset()
-                frame = self._step(0)
+                frame = self._safe_step(0)
                 if frame is None:
                     self._weights = _best_weights
                     break
@@ -292,7 +295,7 @@ class GraphExplorer:
                         self._frontier.discard(cur_h)
                         continue
                     aidx, cx, cy = cs
-                    nf = self._step(aidx, cx, cy)
+                    nf = self._safe_step(aidx, cx, cy)
                     if nf is None:
                         continue
                     ng = self._get_grid(nf)
@@ -319,7 +322,7 @@ class GraphExplorer:
         self._global_tried.clear()
         self._prefix.clear()
         self._env.reset()
-        frame = self._step(0)
+        frame = self._safe_step(0)
         if frame is None:
             return False
         grid = self._get_grid(frame)
@@ -327,7 +330,7 @@ class GraphExplorer:
         self._frontier.add(start_hash)
 
         # ── Counter mask: detect volatile pixels (timer/score) ──
-        _frame2 = self._step(0, 32, 32)
+        _frame2 = self._safe_step(0, 32, 32)
         if _frame2 is not None:
             _g1 = self._get_grid(frame)
             _g2 = self._get_grid(_frame2)
@@ -358,7 +361,7 @@ class GraphExplorer:
                     break
 
                 aidx, cx, cy = cand_seq
-                nf = self._step(aidx, cx, cy)
+                nf = self._safe_step(aidx, cx, cy)
 
                 if nf is None:
                     continue
