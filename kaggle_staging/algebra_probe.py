@@ -28,9 +28,9 @@ def _hash(grid: np.ndarray, step: int = 0) -> int:
     """Canonical hash (D4 Zobrist) with step-modulus deconflict."""
     if _HASHER is None:
         return hash(grid.tobytes())
-    lo, hi = _HASHER(grid)
-    lo ^= (step % 3) << 28
-    return lo
+    h = _HASHER(grid)
+    h ^= (step % 3) << 28
+    return h
 
 
 # ── Action algebra predicates ──
