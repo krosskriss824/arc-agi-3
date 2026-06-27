@@ -1780,6 +1780,10 @@ class VERICODINGAgent:
         "dt20": "grid_nav",
     }
 
+    # GameAction lookup: arcengine GameAction is Enum with tuple values
+    # (e.g., ACTION1 = (1, SimpleAction)). NEVER use GameAction(int). Use this list.
+    _ACTION_LIST = None  # lazily initialized: [GA.ACTION1, ..., GA.ACTION7]
+
     def __init__(self, game_id: str, render_mode: str = "none"):
         self.game_id = game_id
         self.render_mode = render_mode
@@ -1792,6 +1796,7 @@ class VERICODINGAgent:
         self.rng = random.Random(42)
         self.epsilon: float = 0.5
         self.epsilon_min: float = 0.05
+        self._last_action_data: dict | None = None  # click coords for env.step(ga, data=)
         self.epsilon_decay: float = 0.995
         self.model: URMWMA | None = None
         self.game_type: str = self._classify_game(game_id)
@@ -1982,16 +1987,16 @@ class VERICODINGAgent:
             _rhae.visited_reset()  # RHAE Stage-1: clear D4-canonical visited bitset
             _action = self.rng.randint(0, self._n_actions - 1)
             self.action_history.append(_action)
-            ga = _GA(_action + 1)
+            self._last_action_data = None
             return self._to_game_action(_action, frames)
 
         # v19: Blind probe — try ACTION6 @ centroid on first action of game
         if self.action_counter == 1:
-            ga = _GA(6)  # ACTION6
             cx, cy = self._click_centroid(frames)
-            ga.set_data({"x": cx, "y": cy})
-            self._prev_action = 5  # 0-based index for ACTION6
+            self._last_action_data = {"x": cx, "y": cy}
+            self._prev_action = 5
             self.action_history.append(5)
+            ga = _GA.ACTION6
             return ga
 
         frame = frames[-1]
@@ -2249,12 +2254,18 @@ class VERICODINGAgent:
         return 32, 32
 
     def _to_game_action(self, action_int: int, frames: list, latest_frame=None):
-        """Convert 0-based int → GameAction with data for complex actions."""
+        """Convert 0-based int → GameAction (lookup via enum member, NOT int ctor).
+        
+        Data (click coords) is stored in self._last_action_data and must be
+        passed as env.step(ga, data=self._last_action_data) by the caller.
+        """
         from arcengine.enums import GameAction as _GA
-        ga = _GA(action_int + 1)  # 0-based → 1-based
+        _action_by_idx = [_GA.ACTION1, _GA.ACTION2, _GA.ACTION3, _GA.ACTION4,
+                          _GA.ACTION5, _GA.ACTION6, _GA.ACTION7]
+        ga = _action_by_idx[action_int] if 0 <= action_int < 7 else _GA.RESET
         if ga.is_complex():
             cx, cy = self._best_segment_click()
-            ga.set_data({"x": cx, "y": cy})
+            self._last_action_data = {"x": cx, "y": cy}
         return ga
 
     def _urm_predict(self, state):

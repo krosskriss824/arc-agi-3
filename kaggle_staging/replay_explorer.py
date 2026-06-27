@@ -58,7 +58,7 @@ class ReplayExplorer:
 
     __slots__ = (
         "_env", "_hasher", "_n_actions", "_max_depth", "_action_budget",
-        "_step_modulus", "_action_list", "_volatile_mask",
+        "_step_modulus", "_action_list", "_volatile_mask", "_replay_budget",
         "_state_prefix", "_edges", "_tried", "_processed",
         "_current_prefix", "_initial_hash",
         "_effective_actions",
@@ -97,7 +97,9 @@ class ReplayExplorer:
                 _GA.ACTION5, _GA.ACTION6, _GA.ACTION7,
             ]
         self._n_actions = len(self._action_list)
-        self._volatile_mask: np.ndarray | None = None  # set via set_volatile_mask()
+        self._volatile_mask: np.ndarray | None = None
+        # Separate replay budget: 3x exploration budget (replay doesn't count against explore)
+        self._replay_budget = max_actions * 3
         # Stats
         self._effective_actions: set[int] = set()  # populated during explore
         self._winning_combos: list[list[int]] = []
@@ -128,7 +130,7 @@ class ReplayExplorer:
             for state_hash, prefix in states:
                 if state_hash in self._processed:
                     continue
-                if self._action_budget <= 0:
+                if self._action_budget <= 0 or self._replay_budget <= 0:
                     return None
 
                 # Reset + replay prefix to reach this state
@@ -225,7 +227,7 @@ class ReplayExplorer:
                 ga = self._action_list[a]
                 gd = {"x": 32, "y": 32} if ga.is_complex() else None
                 self._env.step(ga, data=gd)
-                self._action_budget -= 1
+                self._replay_budget -= 1
         else:
             # Diverged from target → reset to initial + replay up to LCP + delta
             self._env.reset()
@@ -233,7 +235,7 @@ class ReplayExplorer:
                 ga = self._action_list[a]
                 gd = {"x": 32, "y": 32} if ga.is_complex() else None
                 self._env.step(ga, data=gd)
-                self._action_budget -= 1
+                self._replay_budget -= 1
         self._current_prefix = target_prefix[:]
 
     def set_action6_priority(self) -> None:

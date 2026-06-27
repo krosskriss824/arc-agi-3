@@ -274,9 +274,15 @@ for idx, env_info in enumerate(env_infos):
         if _vmask is not None:
             explorer.set_volatile_mask(_vmask)
         explorer.set_action6_priority()  # farmountain EXP-035: try ACTION6 first
-        # ── v22: Repeated-action probe (for games requiring ×50-200 steps) ──
+        # ── v22: Repeated-action probe (priority order: ACTION6 ≥ ACTION1 ≥ ACTION2 ≥ ...) ──
+        _RA_PRIORITY = (
+            [i for i, g in enumerate(_act_list) if g.name == "ACTION6"]
+            + [i for i, g in enumerate(_act_list) if g.name == "ACTION1"]
+            + [i for i, g in enumerate(_act_list) if g.name == "ACTION2"]
+            + [i for i, g in enumerate(_act_list) if g.name == "ACTION3"]
+        )[:6]
         _repeated_solution = None
-        for _ra_idx in range(min(4, len(_act_list))):
+        for _ra_idx in _RA_PRIORITY:
             env.reset()
             agent.on_game_start()
             for _step_idx in range(MAX_STEPS):
@@ -291,10 +297,12 @@ for idx, env_info in enumerate(env_infos):
                     break
             if _repeated_solution:
                 break
-        if _repeated_solution:
-            bfs_solution = _repeated_solution
-            solved_by_bfs = True
-            score = 1.0
+            if _repeated_solution:
+                bfs_solution = _repeated_solution
+                solved_by_bfs = True
+                _hba = getattr(env_info, "human_baseline_actions", len(_repeated_solution))
+                _aa = len(_repeated_solution)
+                score = min(1.15, (_hba / max(1, _aa)) ** 2)
             game_scores[gid] = score
             bfs_results[gid] = {"solved": True, "n_actions": len(_repeated_solution), "bfs": len(_repeated_solution)}
             _best_score = max(_best_score, score)
@@ -334,13 +342,15 @@ for idx, env_info in enumerate(env_infos):
             agent.on_game_start()
             for _ in range(MAX_STEPS):
                 act = agent.choose_action([frame], None)
+                _act_data = getattr(agent, '_last_action_data', None)
                 if wm is not None:
                     grid = extract_grid(frame)
                     if grid is not None:
-                        tok = wm.encode_state(grid, int(act))
+                        _aid = int(act.value[0]) if hasattr(act, 'value') and isinstance(act.value, tuple) else int(act)
+                        tok = wm.encode_state(grid, _aid)
                         sbuf.append(tok.squeeze(0).cpu().numpy().astype(np.int32))
-                        abuf.append(int(act)); rbuf.append(0.0)
-                nf = env.step(act)
+                        abuf.append(_aid); rbuf.append(0.0)
+                nf = env.step(act, data=_act_data)
                 if nf is None: break
                 r_ = float(getattr(nf, "levels_completed", 0) - getattr(frame, "levels_completed", 0))
                 score += r_
