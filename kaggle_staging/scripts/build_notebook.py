@@ -204,6 +204,8 @@ os.environ.setdefault("ENVIRONMENTS_DIR", str(SRC / "environment_files"))
 from arc_agi import Arcade
 from arcengine import GameState as _GS, enums as _GE
 from wasm_bridge import functional_ttt_train, _extract_head_params, _extract_buffers, pure_batch_ttt_loss
+import graph_explorer as _ge
+import dense_explorer as _de
 from frame_processor import FrameProcessor
 
 arc       = Arcade()
@@ -228,6 +230,9 @@ def extract_grid(frame):
 # Pre-allocate FrameProcessor for counter mask detection
 _fp_counter = FrameProcessor()
 
+# Strategy cache (persists across all games in a run)
+_cache = _gp.StrategyCache()
+
 for idx, env_info in enumerate(env_infos):
     gid = str(getattr(env_info, "game_id", getattr(env_info, "id", idx)))
     env = None; sbuf, abuf, rbuf = [], [], []; score = 0.0
@@ -251,15 +256,13 @@ for idx, env_info in enumerate(env_infos):
         env.reset()
         agent.on_game_start()
         
-        # Strategy cache (loaded once per run)
-        _cache = _gp.StrategyCache()
-        
         # Profile game
         _prof = _gp.profile_game(env)
         _strategy = _gp.choose_solver(_prof, cache=_cache)
         _sig = _gp.compute_signature(_prof)
         print(f"  [{idx+1}] {gid}: {_strategy['name']} (n={_prof.n_actions}, "
-              f"c={_prof.has_complex}, seg_fb={_strategy['use_segment_fallback']})")
+              f"c={_prof.has_complex}, lc={_prof.live_click_found}, "
+              f"seg_fb={_strategy['use_segment_fallback']})")
         
         # Execute strategy
         _solved = False
@@ -280,6 +283,21 @@ for idx, env_info in enumerate(env_infos):
                         break
                 if _solved: break
         
+        elif _strategy["name"] == "graph_explore":
+            # Live click known → segment-based GraphExplorer (fast)
+            _fp = FrameProcessor()
+            _hfn = agent.get_hasher()
+            _rbae = getattr(agent, '_rhae', None)
+            _tt_lk = (lambda lo, hi: _rbae._exp["rhae_tt_lookup"](_rbae._store, lo, hi)
+                      if _rbae and _rbae._wasm_ok else lambda lo, hi: -1)
+            _tt_st = (lambda lo, hi, a, s: _rbae._exp["rhae_tt_store"](_rbae._store, lo, hi, a, s)
+                      if _rbae and _rbae._wasm_ok else lambda lo, hi, a, s: None)
+            _explorer = _ge.GraphExplorer(env, _fp, _hfn, _act_list, _tt_lk, _tt_st)
+            _solved = _explorer.explore(max_steps=_strategy["max_steps"])
+            if _solved and _explorer.solution:
+                _solution = [int(a) for a in _explorer.solution]
+                print(f"  [{idx+1}] {gid}: GraphExplorer solved in {len(_solution)}")
+        
         elif _strategy["name"] == "dense_explore":
             _exp = _de.DenseExplorer(env, _act_list)
             _solved = _exp.explore(max_steps=_strategy["max_steps"])
@@ -287,6 +305,19 @@ for idx, env_info in enumerate(env_infos):
                 _solution = [int(a) for a in _exp.solution]
                 print(f"  [{idx+1}] {gid}: DenseExplorer solved in {len(_solution)} "
                       f"(live_clicks={len(_exp.live_clicks)})")
+            elif _exp.live_clicks and not _solved:
+                # Dense found live clicks → retry with GraphExplorer
+                _fp = FrameProcessor()
+                _hfn = agent.get_hasher()
+                _ge_explorer = _ge.GraphExplorer(env, _fp, _hfn, _act_list, None, None)
+                _solved2 = _ge_explorer.explore(max_steps=500)
+                if _solved2 and _ge_explorer.solution:
+                    _solved = True
+                    _solution = [int(a) for a in _ge_explorer.solution]
+                    print(f"  [{idx+1}] {gid}: Dense→GraphExplorer solved in {len(_solution)}")
+        
+        elif _strategy["name"] == "fallback":
+            print(f"  [{idx+1}] {gid}: no strategy matched, skip to agent loop")
         
         if _solved and _solution:
             _hba = getattr(env_info, "human_baseline_actions", len(_solution))

@@ -7,7 +7,7 @@ class GameProfile:
     __slots__ = ("n_actions", "has_complex", "grid_empty", "has_objects",
                  "n_components", "absorbing", "idempotent", "repeated_win",
                  "dead_actions", "state_changers", "click_actions",
-                 "frame_shape", "action_names")
+                 "frame_shape", "action_names", "live_click_found")
     def __init__(self):
         self.n_actions = 0
         self.has_complex = False
@@ -22,6 +22,7 @@ class GameProfile:
         self.click_actions = []   # indices of complex (click) actions
         self.frame_shape = (64, 64)
         self.action_names = []
+        self.live_click_found = False  # quick probe found state-changing click
 
 # ── Grid predicates ──
 
@@ -89,6 +90,22 @@ def profile_game(env):
     prof.grid_empty = not _has_objects(grid)
     prof.has_objects = _has_objects(grid)
     prof.n_components = _count_components(grid) if not prof.grid_empty else 0
+
+    # ── Step 0.5: Quick live-click probe (5 positions, 5 steps) ──
+    if prof.has_complex:
+        env.reset()
+        _baseline = env.step(actions[0])
+        _bg = _get_grid(_baseline)
+        _bh = hash(_bg.tobytes()) if _bg is not None else -1
+        _ca = actions[prof.click_actions[0]]
+        for _px, _py in [(32,32), (16,16), (48,48), (16,48), (48,16)]:
+            env.reset()
+            _f = env.step(_ca, data={"x": _px, "y": _py})
+            _g = _get_grid(_f)
+            _h = hash(_g.tobytes()) if _g is not None else -1
+            if _h != _bh and _h != -1:
+                prof.live_click_found = True
+                break
 
     # ── Step 1: One-step hash per action ──
     h_after_one = {}
@@ -162,7 +179,7 @@ def profile_game(env):
 def compute_signature(prof):
     """Compute compact hashable signature for strategy cache.
     
-    Keys: n_actions, has_complex, action_efficiency (state_changers / n_actions),
+    Keys: n_actions, has_complex, action_efficiency, live_click_found,
           grid_empty, absorbing_count, dead_ratio, branching_factor
     """
     n = max(1, prof.n_actions)
@@ -174,6 +191,7 @@ def compute_signature(prof):
         "n_absorbing": len(prof.absorbing),
         "dead_ratio": round(len(prof.dead_actions) / n, 2),
         "n_simple": sum(1 for _ in prof.click_actions),
+        "live_click_found": prof.live_click_found,
     }
 
 
@@ -181,7 +199,8 @@ def signature_key(sig):
     """Deterministic string key from signature dict (cache key)."""
     parts = []
     for k in ["n_actions", "has_complex", "action_efficiency",
-              "grid_empty", "n_absorbing", "dead_ratio", "n_simple"]:
+              "grid_empty", "n_absorbing", "dead_ratio", "n_simple",
+              "live_click_found"]:
         parts.append(f"{k}={sig[k]}")
     return "|".join(parts)
 
@@ -226,40 +245,39 @@ class StrategyCache:
             json.dump(self._data, f, indent=2)
 
 
-# ── Simplified decision tree (3 branches: dense/segment/simple) ──
+# ── Typed decision tree (Idris-style, total function, 3 branches) ──
+#
+# data Strategy = Simple | Dense | Graph | Fallback
+#
+# choose : Profile -> Strategy
+# choose p = case (p.hasComplex, p.liveClickFound) of
+#   (False, _)   => Simple     # non-complex only
+#   (True, True)  => Graph      # live click known → segment-based BFS
+#   (True, False) => Dense      # unknown click target → dense scan
 
 def choose_solver(prof, cache=None):
-    """Uproszczony decision tree: 3 ścieżki.
+    """Total function: Profile → Strategy. 3 branches matching Idris spec.
     
     Returns: {"name": str, "max_steps": int, "use_segment_fallback": bool}
     """
-    # 1. Check cache first
+    # Cache check (not part of Idris spec, optimization)
     sig = compute_signature(prof)
     cached = cache.lookup(sig) if cache else None
     if cached and cached.get("solved"):
         return {"name": cached["solver"], "max_steps": 1500, "use_segment_fallback": True}
     
     has_c = prof.has_complex
-    n = prof.n_actions
+    lcf = prof.live_click_found
     
-    # 2. Decision predicates (pure, zero if/elif)
-    predicates = [
-        # non-complex only → simple brute
-        (not has_c,
-         {"name": "simple_brute", "max_steps": 1500, "use_segment_fallback": False}),
-        # single complex action → dense click (no simple fallback needed)
-        (has_c and n == 1,
-         {"name": "dense_explore", "max_steps": 1500, "use_segment_fallback": True}),
-        # multi-action with complex → dense click first, segment fallback
-        (has_c and n >= 2,
-         {"name": "dense_explore", "max_steps": 2000, "use_segment_fallback": True}),
-    ]
-    
-    for cond, result in predicates:
-        if cond:
-            return result
-    
-    return {"name": "dense_explore", "max_steps": 2000, "use_segment_fallback": True}
+    # Decision table: (hasComplex, liveClickFound) → Strategy
+    # Zero if/elif — dictionary dispatch
+    decision = {
+        (False, False): {"name": "simple_brute", "max_steps": 1500, "use_segment_fallback": False},
+        (False, True):  {"name": "simple_brute", "max_steps": 1500, "use_segment_fallback": False},
+        (True, True):   {"name": "graph_explore", "max_steps": 2000, "use_segment_fallback": True},
+        (True, False):  {"name": "dense_explore", "max_steps": 2000, "use_segment_fallback": True},
+    }
+    return decision.get((has_c, lcf), {"name": "fallback", "max_steps": 500, "use_segment_fallback": False})
 
 
 # ── Solver stubs (used from notebook) ──
