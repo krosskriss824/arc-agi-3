@@ -496,8 +496,8 @@ print(f"[build_notebook] ACCELERATOR={ACCELERATOR} | Dataset={DATASET_SLUG}")
 # ── Also update kernel-metadata.json ──
 KM = _ROOT / "kernel-metadata.json"
 km = {
-    "id": f"krisskey/arc3-urm-ttt-v19-action6-centroid-blind-probe",
-    "title": "ARC3 URM TTT v20 w/status bar masking",
+    "id": "krisskey/arc3-urm-ttt-v21-w-replayexplorer-bfs",
+    "title": "ARC3 URM TTT v21 w/ReplayExplorer BFS",
     "code_file": "submission.ipynb",
     "language": "python",
     "kernel_type": "notebook",

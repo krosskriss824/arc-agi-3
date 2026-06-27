@@ -58,7 +58,7 @@ class ReplayExplorer:
 
     __slots__ = (
         "_env", "_hasher", "_n_actions", "_max_depth", "_action_budget",
-        "_step_modulus", "_action_list",
+        "_step_modulus", "_action_list", "_volatile_mask",
         "_state_prefix", "_edges", "_tried", "_processed",
         "_current_prefix", "_initial_hash",
         "_effective_actions",
