@@ -282,14 +282,14 @@ for idx, env_info in enumerate(env_infos):
             _fp = FrameProcessor()
             _hfn = agent.get_hasher()
             _rbae = getattr(agent, '_rhae', None)
-            _tt_lk = (lambda lo, hi: _rbae.exports[_rbae._store]["rhae_tt_lookup"](_rbae._store, lo, hi)
-                      if _rbae else lambda lo, hi: -1)
-            _tt_st = (lambda lo, hi, a, s: _rbae.exports[_rbae._store]["rhae_tt_store"](_rbae._store, lo, hi, a, s)
-                      if _rbae else lambda lo, hi, a, s: None)
+            _tt_lk = (lambda lo, hi: _rbae._exp["rhae_tt_lookup"](_rbae._store, lo, hi)
+                      if _rbae and _rbae._wasm_ok else lambda lo, hi: -1)
+            _tt_st = (lambda lo, hi, a, s: _rbae._exp["rhae_tt_store"](_rbae._store, lo, hi, a, s)
+                      if _rbae and _rbae._wasm_ok else lambda lo, hi, a, s: None)
             _explorer = _ge.GraphExplorer(env, _fp, _hfn, _act_list, _tt_lk, _tt_st)
             _solved = _explorer.explore(max_steps=2000)
             if _solved and _explorer.solution:
-                _solution = _explorer.solution
+                _solution = [int(a) for a in _explorer.solution]
                 print(f"  [{idx+1}] {gid}: GraphExplorer solved in {len(_solution)} actions")
         
         if _solved and _solution:
