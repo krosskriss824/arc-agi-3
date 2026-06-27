@@ -187,10 +187,9 @@ class FrameProcessor:
         return (frame1 != frame2).astype(bool)
 
     def compute_click_point(self, segmented_frame: np.ndarray, segment_id: int) -> tuple[int, int]:
-        """Get random pixel inside segment for ACTION6 click."""
+        """Return CENTROID of segment (mean of all pixel positions). Deterministic."""
         mask = segmented_frame == segment_id
         ys, xs = mask.nonzero()
         if len(ys) == 0:
             return 32, 32
-        idx = np.random.randint(len(ys))
-        return int(xs[idx]), int(ys[idx])
+        return int(np.mean(xs)), int(np.mean(ys))

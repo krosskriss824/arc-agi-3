@@ -136,13 +136,24 @@ class GraphExplorer:
         label_map, components = self._fp.segment_frame(grid)
         groups = self._fp.frame_segments_to_action_groups(components, 5)
         result = []
+        has_clickable = False
         for gid, seg_ids in enumerate(groups):
             for sid in seg_ids:
                 if self._click_idx is None:
                     continue
                 cx, cy = self._fp.compute_click_point(label_map, sid)
                 area = components[sid]["area"] if sid < len(components) else 1
+                # Skip background segment (all-black, area=4096) unless it's the only one
+                if area >= 3072 and len(components) > 1 and components[sid]["color"] == 0:
+                    continue
                 result.append((gid, cx, cy, sid, area))
+                has_clickable = True
+
+        # Dense scan fallback: if no clickable candidates (all-black grid), generate 8×8 grid
+        if not has_clickable and self._click_idx is not None:
+            for gx in range(0, 64, 8):
+                for gy in range(0, 64, 8):
+                    result.append((3, gx, gy, -1, 1))  # G3 = non-salient
         return result
 
     def _score_candidate(self, tier, cx, cy, area, max_area):
