@@ -204,6 +204,7 @@ from arc_agi import Arcade
 from arcengine import GameState as _GS, enums as _GE
 from wasm_bridge import functional_ttt_train, _extract_head_params, _extract_buffers, pure_batch_ttt_loss
 import algebra_probe as _ap
+import ida_star as _ida
 from frame_processor import FrameProcessor
 
 arc       = Arcade()
@@ -277,15 +278,37 @@ for idx, env_info in enumerate(env_infos):
                 if _solved:
                     break
         elif _strategy["name"] == "ida_star":
-            # IDA* with n_components heuristic — TODO: implement in v22.1
-            pass
+            # IDA* with n_components heuristic
+            _min_comp = 99
+            env.reset()
+            for _p in range(5):  # sample 5 states for min_components estimate
+                _pg = _act_list[_p % len(_act_list)]
+                _pgd = {"x": 32, "y": 32} if _pg.is_complex() else None
+                _pf = env.step(_pg, data=_pgd)
+                _pgrid = extract_grid(_pf)
+                if _pgrid is not None:
+                    _nc = _ida._n_components(_pgrid)
+                    if _nc < _min_comp: _min_comp = _nc
+                    if getattr(_pf, "state", None) is _GS.WIN:
+                        _solved = True
+                        _solution = [_p]
+                        break
+                env.reset()
+            if not _solved:
+                _heuristic = _ida.make_heuristic(_min_comp)
+                _sol = _ida.ida_star(env, _act_list, _heuristic,
+                                     max_steps=2000, max_depth=30)
+                if _sol is not None:
+                    _solved = True
+                    _solution = _sol
+                    print(f"  [{idx+1}] {gid}: IDA* solved in {len(_sol)} actions")
         
         if _solved and _solution:
             _hba = getattr(env_info, "human_baseline_actions", len(_solution))
             _aa = len(_solution)
             score = min(1.15, (_hba / max(1, _aa)) ** 2)
             game_scores[gid] = score
-            bfs_results[gid] = {"solved": True, "n_actions": len(_solution), "bfs": len(_solution)}
+            bfs_results[gid] = {"solved": True, "n_actions": len(_solution), "solver": _strategy['name']}
             _best_score = max(_best_score, score)
             continue  # solved, skip agent loop
         # Fallback: agent loop (existing code below)
