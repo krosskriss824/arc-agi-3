@@ -67,7 +67,7 @@ if SRC is None: raise SystemExit("[ERR] vericoding-urm not found")
 print(f"Dataset: {{SRC}}")
 
 for fname in ["submission_agent.py", "kaggle_main.py", "wasm_bridge.py",
-              "frame_processor.py", "algebra_probe.py", "graph_explorer.py",
+              "frame_processor.py", "game_profiler.py", "graph_explorer.py",
               "wasm_bridge.wasm", "urm_checkpoint.pt", "rhae_stage1.wasm"]:
     f = SRC / fname
     if f.exists(): shutil.copy2(f, WK / fname)
@@ -193,17 +193,16 @@ else:
     print("[GPU] CPU only")
 ''')
 
-# ── Cell 4: Phase A - Algebra Probe Pipeline + Counter Mask + Optional TTT ──
+# ── Cell 4: Phase A - Game Profiler Pipeline + Counter Mask + Optional TTT ──
 CELL_4 = textwrap.dedent('''\
 # ═══════════════════════════════════════════════════════════════
-# CELL 4: Phase A - Algebra Probe Pipeline + Counter Mask
+# CELL 4: Phase A - Game Profiler Pipeline + Counter Mask
 # ═══════════════════════════════════════════════════════════════
 os.environ.setdefault("OPERATION_MODE", "offline")
 os.environ.setdefault("ENVIRONMENTS_DIR", str(SRC / "environment_files"))
 from arc_agi import Arcade
 from arcengine import GameState as _GS, enums as _GE
 from wasm_bridge import functional_ttt_train, _extract_head_params, _extract_buffers, pure_batch_ttt_loss
-import algebra_probe as _ap
 import graph_explorer as _ge
 from frame_processor import FrameProcessor
 
@@ -240,10 +239,8 @@ for idx, env_info in enumerate(env_infos):
         if frame is None: continue
         agent.on_game_start()
 
-        # ── v22: Algebra Probe Pipeline (replaces BFS entirely) ──
-        hasher = agent.get_hasher()
-        import algebra_probe as _ap
-        _ap.set_hasher(hasher)
+        # ── v22.38: Game Profiler + Decision Tree pipeline ──
+        import game_profiler as _gp
         _act_list = list(getattr(env, "action_space", []))
         if not _act_list:
             _act_list = [_GE.GameAction.ACTION1, _GE.GameAction.ACTION2,
@@ -252,33 +249,30 @@ for idx, env_info in enumerate(env_infos):
                          _GE.GameAction.ACTION7]
         env.reset()
         agent.on_game_start()
-        _algebra_tags = _ap.probe_action_algebra(env, max_probe_steps=2500)
-        _strategy = _ap.choose_strategy(_algebra_tags, len(_act_list))
-        print(f"  [{idx+1}] {gid}: {_strategy['reason']} ({_strategy['name']}, "
-              f"indices={_strategy['action_indices']}, "
-              f"max_steps={_strategy['max_steps']})")
+        _prof = _gp.profile_game(env)
+        _strategy = _gp.choose_solver(_prof)
+        print(f"  [{idx+1}] {gid}: {_strategy['name']} (n={_prof.n_actions}, "
+              f"empty={_prof.grid_empty}, c={_prof.has_complex}, "
+              f"rw={_prof.repeated_win}, absorb={_prof.absorbing})")
         # Execute strategy
         _solved = False
         _solution = None
-        if _strategy["name"] in ("repeated_action", "periodic_probe"):
-            for _a_idx in _strategy["action_indices"]:
-                env.reset()
-                agent.on_game_start()
-                _ga = _act_list[_a_idx]
-                for _k in range(_strategy["max_steps"]):
-                    _gd = {"x": 32, "y": 32} if _ga.is_complex() else None
-                    _nf = env.step(_ga, data=_gd)
-                    if _nf is None:
-                        break
-                    if getattr(_nf, "state", None) is _GS.WIN:
-                        _solved = True
-                        _solution = [_a_idx] * (_k + 1)
-                        print(f"  [{idx+1}] {gid}: {_ga.name}*{_k+1} -> WIN")
-                        break
-                if _solved:
-                    break
-        elif _strategy["name"] == "graph_explorer":
-            # GraphExplorer: frontier-based BFS with priority-tier candidates
+        if _strategy["name"] == "repeated_action":
+            _solution = _gp.solve_repeated_action(env, _strategy, _act_list)
+            if _solution:
+                _solved = True
+                _aa = len(_solution)
+                print(f"  [{idx+1}] {gid}: repeated*{_aa} -> WIN")
+        elif _strategy["name"] == "blind_click":
+            _ga = _act_list[_strategy["indices"][0]]
+            _nf = env.step(_ga, data={"x": 32, "y": 32})
+            if _nf and _gp._is_win(_nf):
+                _solved = True
+                _solution = [_strategy["indices"][0]]
+                print(f"  [{idx+1}] {gid}: blind click -> WIN")
+        elif _strategy["name"] == "skip":
+            print(f"  [{idx+1}] {gid}: no-op game, skipping")
+        elif _strategy["name"] in ("click_explore", "dense_scan", "graph_explore", "dense_then_graph"):
             _fp = FrameProcessor()
             _hfn = agent.get_hasher()
             _rbae = getattr(agent, '_rhae', None)
@@ -287,10 +281,10 @@ for idx, env_info in enumerate(env_infos):
             _tt_st = (lambda lo, hi, a, s: _rbae._exp["rhae_tt_store"](_rbae._store, lo, hi, a, s)
                       if _rbae and _rbae._wasm_ok else lambda lo, hi, a, s: None)
             _explorer = _ge.GraphExplorer(env, _fp, _hfn, _act_list, _tt_lk, _tt_st)
-            _solved = _explorer.explore(max_steps=2000)
+            _solved = _explorer.explore(max_steps=_strategy["max_steps"])
             if _solved and _explorer.solution:
                 _solution = [int(a) for a in _explorer.solution]
-                print(f"  [{idx+1}] {gid}: GraphExplorer solved in {len(_solution)} actions")
+                print(f"  [{idx+1}] {gid}: GraphExplorer solved in {len(_solution)}")
         
         if _solved and _solution:
             _hba = getattr(env_info, "human_baseline_actions", len(_solution))

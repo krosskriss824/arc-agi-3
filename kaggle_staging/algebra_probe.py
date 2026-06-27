@@ -60,10 +60,8 @@ def _to_grid(frame) -> np.ndarray | None:
 
 def _is_win(frame) -> bool:
     """Check if frame state is WIN."""
-    return getattr(frame, "state", None) is not None and (
-        str(getattr(frame, "state", "")) == "GameState.WIN"
-        or str(getattr(frame, "state", "")).endswith("WIN")
-    )
+    s = getattr(frame, "state", None)
+    return s is not None and "WIN" in str(s)
 
 
 # ── Probe functions ──
