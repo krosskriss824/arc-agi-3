@@ -81,6 +81,8 @@ def profile_game(env):
 
     # ── Step 0: Analyze initial frame ──
     env.reset()
+    env.step(actions[0])  # initialize game
+    env.reset()
     frame = env.step(actions[0])
     grid = _get_grid(frame)
     prof.frame_shape = grid.shape if grid is not None else (64, 64)
@@ -147,75 +149,120 @@ def profile_game(env):
         if _budget <= 0: break
         env.reset()
         for k in range(1, min(100, _budget // max(1, prof.n_actions - i)) + 1):
-            env.step(a, data={"x": 32, "y": 32} if a.is_complex() else None)
-            if _is_win(env):
+            _nf = env.step(a, data={"x": 32, "y": 32} if a.is_complex() else None)
+            if _nf is not None and _is_win(_nf):
                 prof.repeated_win.append(i)
                 break
 
     return prof
 
 
-# ── Decision tree (dictionary dispatch, zero if/elif in hot path) ──
+# ── Strategy signature ──
 
-_SOLVER_REGISTRY = {}
-
-def register_solver(name, fn):
-    _SOLVER_REGISTRY[name] = fn
-
-def choose_solver(prof):
-    """Pure functional decision tree: profile → solver name + params.
-    Returns: {"name": str, "max_steps": int, "action_indices": list}
+def compute_signature(prof):
+    """Compute compact hashable signature for strategy cache.
+    
+    Keys: n_actions, has_complex, action_efficiency (state_changers / n_actions),
+          grid_empty, absorbing_count, dead_ratio, branching_factor
     """
-    n = prof.n_actions
+    n = max(1, prof.n_actions)
+    return {
+        "n_actions": prof.n_actions,
+        "has_complex": prof.has_complex,
+        "action_efficiency": round(len(prof.state_changers) / n, 2),
+        "grid_empty": prof.grid_empty,
+        "n_absorbing": len(prof.absorbing),
+        "dead_ratio": round(len(prof.dead_actions) / n, 2),
+        "n_simple": sum(1 for _ in prof.click_actions),
+    }
+
+
+def signature_key(sig):
+    """Deterministic string key from signature dict (cache key)."""
+    parts = []
+    for k in ["n_actions", "has_complex", "action_efficiency",
+              "grid_empty", "n_absorbing", "dead_ratio", "n_simple"]:
+        parts.append(f"{k}={sig[k]}")
+    return "|".join(parts)
+
+
+class StrategyCache:
+    """Persistent strategy cache: signature_key → best solver + params.
+    
+    Example: {
+        "sig_X": {"solver": "dense_explore", "solved": True, "n_actions": 12},
+        "sig_Y": {"solver": "simple_brute", "solved": False, "n_actions": 0},
+    }
+    """
+    def __init__(self, data=None):
+        self._data = data or {}
+    
+    def lookup(self, sig):
+        k = signature_key(sig)
+        return self._data.get(k)
+    
+    def store(self, sig, solver_name, solved, n_actions):
+        k = signature_key(sig)
+        entry = {"solver": solver_name, "solved": solved, "n_actions": n_actions}
+        # Only overwrite if better (prev + solved, or if first)
+        existing = self._data.get(k)
+        if existing is None or (solved and not existing.get("solved")):
+            self._data[k] = entry
+        elif solved and n_actions < existing.get("n_actions", 9999):
+            self._data[k] = entry  # shorter solution = better
+    
+    @classmethod
+    def from_file(cls, path="strategy_cache.json"):
+        try:
+            import json
+            with open(path) as f:
+                return cls(json.load(f))
+        except Exception:
+            return cls()
+    
+    def to_file(self, path="strategy_cache.json"):
+        import json
+        with open(path, "w") as f:
+            json.dump(self._data, f, indent=2)
+
+
+# ── Simplified decision tree (3 branches: dense/segment/simple) ──
+
+def choose_solver(prof, cache=None):
+    """Uproszczony decision tree: 3 ścieżki.
+    
+    Returns: {"name": str, "max_steps": int, "use_segment_fallback": bool}
+    """
+    # 1. Check cache first
+    sig = compute_signature(prof)
+    cached = cache.lookup(sig) if cache else None
+    if cached and cached.get("solved"):
+        return {"name": cached["solver"], "max_steps": 1500, "use_segment_fallback": True}
+    
     has_c = prof.has_complex
-    empty = prof.grid_empty
-    objs = prof.has_objects
-    ncomp = prof.n_components
-    rw = prof.repeated_win
-    state_ch = prof.state_changers
-    dead = prof.dead_actions
-
-    # Decision predicates → solver
+    n = prof.n_actions
+    
+    # 2. Decision predicates (pure, zero if/elif)
     predicates = [
-        # (condition, solver_name, params)
-        (len(rw) > 0,
-         "repeated_action", {"max_steps": 200, "indices": rw}),
-
-        (len(prof.absorbing) > 0 and has_c and empty,
-         "blind_click", {"max_steps": 1, "indices": prof.absorbing}),
-
-        (len(prof.absorbing) > 0 and not has_c,
-         "skip", {"max_steps": 1, "indices": []}),
-
-        (n == 1 and not has_c,
-         "repeated_action", {"max_steps": 200, "indices": [0]}),
-
-        (n == 1 and has_c and not empty,
-         "click_explore", {"max_steps": 500, "indices": [0]}),
-
-        (n == 1 and has_c and empty,
-         "dense_scan", {"max_steps": 500, "indices": [0]}),
-
-        (n >= 2 and has_c and not empty,
-         "graph_explore", {"max_steps": 2000}),
-
-        (n >= 2 and has_c and empty,
-         "dense_then_graph", {"max_steps": 2000}),
-
-        (n >= 2 and not has_c,
-         "repeated_action", {"max_steps": 500, "indices": state_ch or list(range(n))}),
-
-        # Fallback
-        (True, "graph_explore", {"max_steps": 2000}),
+        # non-complex only → simple brute
+        (not has_c,
+         {"name": "simple_brute", "max_steps": 1500, "use_segment_fallback": False}),
+        # single complex action → dense click (no simple fallback needed)
+        (has_c and n == 1,
+         {"name": "dense_explore", "max_steps": 1500, "use_segment_fallback": True}),
+        # multi-action with complex → dense click first, segment fallback
+        (has_c and n >= 2,
+         {"name": "dense_explore", "max_steps": 2000, "use_segment_fallback": True}),
     ]
-
-    for cond, name, params in predicates:
+    
+    for cond, result in predicates:
         if cond:
-            return {"name": name, **params}
-    return {"name": "graph_explore", "max_steps": 2000}
+            return result
+    
+    return {"name": "dense_explore", "max_steps": 2000, "use_segment_fallback": True}
 
 
-# ── Solver stubs (registered from notebook) ──
+# ── Solver stubs (used from notebook) ──
 
 def solve_repeated_action(env, strategy, act_list):
     """Try each action repeatedly up to max_steps."""
