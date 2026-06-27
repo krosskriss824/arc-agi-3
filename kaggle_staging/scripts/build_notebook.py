@@ -67,7 +67,7 @@ if SRC is None: raise SystemExit("[ERR] vericoding-urm not found")
 print(f"Dataset: {{SRC}}")
 
 for fname in ["submission_agent.py", "kaggle_main.py", "wasm_bridge.py",
-              "frame_processor.py", "algebra_probe.py", "ida_star.py",
+              "frame_processor.py", "algebra_probe.py", "graph_explorer.py",
               "wasm_bridge.wasm", "urm_checkpoint.pt", "rhae_stage1.wasm"]:
     f = SRC / fname
     if f.exists(): shutil.copy2(f, WK / fname)
@@ -204,7 +204,7 @@ from arc_agi import Arcade
 from arcengine import GameState as _GS, enums as _GE
 from wasm_bridge import functional_ttt_train, _extract_head_params, _extract_buffers, pure_batch_ttt_loss
 import algebra_probe as _ap
-import ida_star as _ida
+import graph_explorer as _ge
 from frame_processor import FrameProcessor
 
 arc       = Arcade()
@@ -278,30 +278,19 @@ for idx, env_info in enumerate(env_infos):
                 if _solved:
                     break
         elif _strategy["name"] == "ida_star":
-            # IDA* with n_components heuristic
-            _min_comp = 99
-            env.reset()
-            for _p in range(5):  # sample 5 states for min_components estimate
-                _pg = _act_list[_p % len(_act_list)]
-                _pgd = {"x": 32, "y": 32} if _pg.is_complex() else None
-                _pf = env.step(_pg, data=_pgd)
-                _pgrid = extract_grid(_pf)
-                if _pgrid is not None:
-                    _nc = _ida._n_components(_pgrid)
-                    if _nc < _min_comp: _min_comp = _nc
-                    if getattr(_pf, "state", None) is _GS.WIN:
-                        _solved = True
-                        _solution = [_p]
-                        break
-                env.reset()
-            if not _solved:
-                _heuristic = _ida.make_heuristic(_min_comp)
-                _sol = _ida.ida_star(env, _act_list, _heuristic,
-                                     max_steps=2000, max_depth=30)
-                if _sol is not None:
-                    _solved = True
-                    _solution = _sol
-                    print(f"  [{idx+1}] {gid}: IDA* solved in {len(_sol)} actions")
+            # GraphExplorer: frontier-based BFS with priority-tier candidates
+            _fp = FrameProcessor()
+            _hfn = agent.get_hasher()
+            _rbae = getattr(agent, '_rhae', None)
+            _tt_lk = (lambda lo, hi: _rbae.exports[_rbae._store]["rhae_tt_lookup"](_rbae._store, lo, hi)
+                      if _rbae else lambda lo, hi: -1)
+            _tt_st = (lambda lo, hi, a, s: _rbae.exports[_rbae._store]["rhae_tt_store"](_rbae._store, lo, hi, a, s)
+                      if _rbae else lambda lo, hi, a, s: None)
+            _explorer = _ge.GraphExplorer(env, _fp, _hfn, _act_list, _tt_lk, _tt_st)
+            _solved = _explorer.explore(max_steps=2000)
+            if _solved and _explorer.solution:
+                _solution = _explorer.solution
+                print(f"  [{idx+1}] {gid}: GraphExplorer solved in {len(_solution)} actions")
         
         if _solved and _solution:
             _hba = getattr(env_info, "human_baseline_actions", len(_solution))
