@@ -260,7 +260,7 @@ for idx, env_info in enumerate(env_infos):
         # Execute strategy
         _solved = False
         _solution = None
-        if _strategy["name"] in ("blind_probe", "repeated_action", "periodic_probe"):
+        if _strategy["name"] in ("repeated_action", "periodic_probe"):
             for _a_idx in _strategy["action_indices"]:
                 env.reset()
                 agent.on_game_start()
@@ -277,7 +277,7 @@ for idx, env_info in enumerate(env_infos):
                         break
                 if _solved:
                     break
-        elif _strategy["name"] == "ida_star":
+        elif _strategy["name"] == "graph_explorer":
             # GraphExplorer: frontier-based BFS with priority-tier candidates
             _fp = FrameProcessor()
             _hfn = agent.get_hasher()

@@ -182,32 +182,25 @@ def choose_strategy(algebra_tags: frozenset, n_actions: int) -> dict:
         - action_indices: list[int] (actions to try in order)
         - max_steps: int (budget)
     """
-    # Priority 1: game has an absorbing action → 1-step blind probe
-    for tag in algebra_tags:
-        if tag.startswith("absorbing_"):
-            idx = int(tag.split("_")[1])
-            return {"name": "blind_probe", "action_indices": [idx],
-                    "max_steps": 1, "reason": f"absorbing action at index {idx}"}
-    
-    # Priority 2: game has repeated-action win
+    # Priority 1: game has repeated-action win (e.g. 50×ACTION1)
     repeated = sorted([int(t.split("_")[2]) for t in algebra_tags 
                        if t.startswith("repeated_win_")])
     if repeated:
         return {"name": "repeated_action", "action_indices": repeated,
                 "max_steps": 200, "reason": f"repeated action WIN at indices {repeated}"}
     
-    # Priority 3: periodic action → repeated with period
+    # Priority 2: periodic action → repeated with period
     periodic = [t for t in algebra_tags if t.startswith("periodic_")]
     if periodic:
         indices = sorted(set(int(t.split("_")[1]) for t in periodic))
         return {"name": "periodic_probe", "action_indices": indices,
                 "max_steps": 200, "reason": f"periodic actions at indices {indices}"}
     
-    # Priority 4: all idempotent → permutation game → IDA*
-    if "has_absorbing" not in algebra_tags and "has_idempotent" in algebra_tags:
-        return {"name": "ida_star", "action_indices": list(range(n_actions)),
-                "max_steps": 2000, "reason": "idempotent actions suggest permutation game"}
+    # Priority 3: all idempotent → permutation game → IDA*
+    if "has_idempotent" in algebra_tags:
+        return {"name": "graph_explorer", "action_indices": list(range(n_actions)),
+                "max_steps": 2000, "reason": "idempotent actions, running GraphExplorer"}
     
-    # Fallback: try ACTION6 then probe all actions
-    return {"name": "fallback_probe", "action_indices": list(range(n_actions)),
-            "max_steps": 2000, "reason": "unknown algebra, probing all"}
+    # ALL OTHER games → GraphExplorer with FrameProcessor + heuristic ranker
+    return {"name": "graph_explorer", "action_indices": list(range(n_actions)),
+            "max_steps": 2000, "reason": "unknown algebra, running GraphExplorer"}

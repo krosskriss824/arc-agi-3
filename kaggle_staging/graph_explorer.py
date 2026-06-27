@@ -3,13 +3,17 @@
 Port of dolphin-in-a-coma/arc-agi-3-just-explore (3rd place, 17/25 levels).
 Differences: WASM canonical_hash, FrameProcessor segments, WASM TT.
 
+New: heuristic ranker (0 params) scores each candidate:
+  confidence = w0*(5-tier) + w1*coverage_norm + w2*novelty
+
 Strategy:
   1. Segment current frame → priority-tiered click candidates (cx, cy)
-  2. Try untried candidates via ACTION6 @ (cx, cy)
-  3. Record (state_hash, candidate) → result_hash edges
-  4. Frontier BFS for distance tracking → pick closest frontier node
-  5. On WIN: extract solution path
-  6. On dead end (all candidates tried at a state): revert to previous state
+  2. Score all untried candidates with heuristic ranker
+  3. Pick highest-scored candidate, execute ACTION6 @ (cx, cy)
+  4. Record (state_hash, candidate) → result_hash edges
+  5. Frontier BFS for distance tracking → pick closest frontier node
+  6. On WIN: extract solution path
+  7. On dead end (all candidates tried at a state): revert to previous state
 """
 
 from collections import deque
@@ -18,33 +22,42 @@ from typing import Any
 
 
 class NodeInfo:
-    __slots__ = ("groups", "active_group", "tried_mask", "tried_simple", "edge_data", "is_dead")
-    def __init__(self, groups):
-        self.groups = groups
-        self.active_group = 0
-        self.tried_mask = 0  # bitmask for current group
-        self.tried_simple = 0  # bitmask for simple (non-click) actions tried
+    __slots__ = ("group_of", "candidates", "tried_mask", "tried_simple", "edge_data", "is_dead")
+    def __init__(self, group_of, candidates):
+        # group_of[i] = priority tier 0-4 for candidate i
+        self.group_of = group_of
+        self.candidates = candidates  # [(cx, cy, sid, area), ...]
+        self.tried_mask = 0  # bit i = 1 if candidate i tried
+        self.tried_simple = 0
         self.edge_data = {}
         self.is_dead = False
 
 
 class GraphExplorer:
-    def __init__(self, env, fp, hasher, action_list, tt_lookup=None, tt_store=None):
+    # Heuristic weights (manual, 0 params, no training)
+    W_TIER    = 10.0  # priority tier (G0=5 → 50pts, G4=1 → 10pts)
+    W_AREA    = 5.0   # coverage area (larger = more likely target)
+    W_NOVELTY = 3.0   # never tried in any state = bonus
+    W_WASM    = 1.0   # WASM build_candidates score (0-100)
+
+    def __init__(self, env, fp, hasher, action_list, tt_lookup=None, tt_store=None,
+                 wasm_scorer=None):
         self._env = env
         self._fp = fp
         self._hasher = hasher
         self._actions = action_list
-        # find first complex (click) action for candidate clicks
         self._click_idx = next((i for i, a in enumerate(self._actions) if a.is_complex()), None)
         self._simple_indices = [i for i, a in enumerate(self._actions) if not a.is_complex()]
         self._tt_lk = tt_lookup
         self._tt_st = tt_store
+        self._wasm_scorer = wasm_scorer  # fn(cx, cy) → score or None
 
         self._nodes = {}
-        self._edges = {}  # (state_hash, seg_id) -> (result_hash, frame)
+        self._edges = {}
         self._frontier = set()
-        self._path = []  # list of (action_idx, cx, cy)
+        self._path = []
         self._distances = {}
+        self._global_tried = set()  # all (cx, cy) tried across states
         self._total_steps = 0
         self._budget = 0
         self.solution = None
@@ -92,42 +105,75 @@ class GraphExplorer:
         result = []
         for gid, seg_ids in enumerate(groups):
             for sid in seg_ids:
-                if self._click_idx is not None:
-                    cx, cy = self._fp.compute_click_point(label_map, sid)
-                    result.append((gid, cx, cy, sid))
+                if self._click_idx is None:
+                    continue
+                cx, cy = self._fp.compute_click_point(label_map, sid)
+                area = components[sid]["area"] if sid < len(components) else 1
+                result.append((gid, cx, cy, sid, area))
         return result
+
+    def _score_candidate(self, tier, cx, cy, area, max_area):
+        """Heuristic confidence score for a candidate (0 params, manual weights)."""
+        tier_score = (5 - tier) * self.W_TIER         # G0=50, G4=10
+        area_norm = (area / max(1, max_area)) * self.W_AREA  # 0-W_AREA
+        novelty = self.W_NOVELTY if (cx, cy) not in self._global_tried else 0.0
+        return tier_score + area_norm + novelty
 
     def _get_or_create_node(self, s_hash, frame):
         if s_hash not in self._nodes:
             cands = self._candidates_from_frame(frame)
-            groups = [[], [], [], [], []]
-            for gid, cx, cy, sid in cands:
+            groups_list = [[] for _ in range(5)]
+            areas = {}
+            for gid, cx, cy, sid, area in cands:
                 if gid < 5:
-                    groups[gid].append((cx, cy, sid))
-            self._nodes[s_hash] = NodeInfo(groups)
+                    groups_list[gid].append((cx, cy, sid, area))
+                    areas[(cx, cy)] = area
+            # Flatten all candidates into one list with their group
+            all_cands = []
+            group_of = []
+            max_area = 1
+            for gid in range(5):
+                for cx, cy, sid, area in groups_list[gid]:
+                    all_cands.append((cx, cy, sid, area))
+                    group_of.append(gid)
+                    max_area = max(max_area, area)
+            # Sort by heuristic score descending
+            scored = [(self._score_candidate(group_of[i], cx, cy, area, max_area), i)
+                      for i, (cx, cy, _, area) in enumerate(all_cands)]
+            scored.sort(key=lambda x: -x[0])
+            # Reorder candidates by score
+            sorted_cands = [all_cands[i] for _, i in scored]
+            sorted_groups = [group_of[i] for _, i in scored]
+            self._nodes[s_hash] = NodeInfo(sorted_groups, sorted_cands)
         return self._nodes[s_hash]
 
     def _next_untried(self, s_hash):
-        """Return (action_idx, cx, cy) or None if all exhausted."""
+        """Return (action_idx, cx, cy) or None if all exhausted.
+        Picks highest-scored untried candidate."""
         node = self._nodes.get(s_hash)
         if node is None or node.is_dead:
             return None
 
-        # Phase 1: try click candidates from FrameProcessor
-        while node.active_group < 5:
-            group = node.groups[node.active_group]
-            if not group:
-                node.active_group += 1
-                continue
-            for i, (cx, cy, _) in enumerate(group):
-                if not (node.tried_mask >> i & 1):
-                    node.tried_mask |= 1 << i
-                    if self._click_idx is not None:
-                        return (self._click_idx, cx, cy)
-            node.active_group += 1
-            node.tried_mask = 0
+        # Find best untried click candidate
+        best_idx = -1
+        best_score = -9999.0
+        for i in range(len(node.candidates)):
+            if not (node.tried_mask >> i & 1):
+                cx, cy, sid, area = node.candidates[i]
+                gid = node.group_of[i]
+                max_area = max(a for _, _, _, a in node.candidates) if node.candidates else 1
+                s = self._score_candidate(gid, cx, cy, area, max_area)
+                if s > best_score:
+                    best_score = s
+                    best_idx = i
 
-        # Phase 2: try simple (non-click) actions
+        if best_idx >= 0:
+            node.tried_mask |= 1 << best_idx
+            cx, cy, _, _ = node.candidates[best_idx]
+            self._global_tried.add((cx, cy))
+            return (self._click_idx, cx, cy)
+
+        # Fallback: try simple actions
         for i, aidx in enumerate(self._simple_indices):
             if not (node.tried_simple >> i & 1):
                 node.tried_simple |= 1 << i
@@ -145,9 +191,9 @@ class GraphExplorer:
         self._frontier.clear()
         self._path.clear()
         self._distances.clear()
+        self._global_tried.clear()
         self.solution = None
 
-        # initial probe
         self._env.reset()
         frame = self._step(0)
         if frame is None:
@@ -161,7 +207,6 @@ class GraphExplorer:
                 break
 
             self._rebuild_distances()
-            # farthest frontier node first (breadth-first frontier)
             ordered = sorted(self._frontier, key=lambda h: -self._distances.get(h, 0))
             if not ordered:
                 break
@@ -172,31 +217,39 @@ class GraphExplorer:
                 self._frontier.discard(cur_hash)
                 continue
 
-            # replay to this state
-            cand_seq = self._next_untried(cur_hash)
-            if cand_seq is None:
-                self._frontier.discard(cur_hash)
-                continue
+            self._backtrack(cur_hash)
 
-            aidx, cx, cy = cand_seq
-            nf = self._step(aidx, cx, cy)
+            # ── TRY ALL CANDIDATES AT THIS STATE ──
+            while True:
+                cand_seq = self._next_untried(cur_hash)
+                if cand_seq is None:
+                    self._frontier.discard(cur_hash)
+                    break
 
-            if nf is None:
-                continue
+                aidx, cx, cy = cand_seq
+                nf = self._step(aidx, cx, cy)
 
-            if self._is_win(nf):
-                self._path.append((aidx, cx, cy))
-                self.solution = [int(a) for a, _, _ in self._path]
-                return True
+                if nf is None:
+                    continue
 
-            ng = self._get_grid(nf)
-            nhash = self._grid_hash(ng)
+                if self._is_win(nf):
+                    self._path.append((aidx, cx, cy))
+                    self.solution = [int(a) for a, _, _ in self._path]
+                    return True
 
-            seg_key = cx * 1000 + cy  # unique per candidate
-            self._edges[(cur_hash, seg_key)] = (nhash, nf)
+                ng = self._get_grid(nf)
+                nhash = self._grid_hash(ng)
 
-            if nhash != cur_hash and nhash not in self._nodes:
-                self._frontier.add(nhash)
-                self._path.append((aidx, cx, cy))
+                seg_key = cx * 1000 + cy
+                self._edges[(cur_hash, seg_key)] = (nhash, nf)
+
+                if nhash != cur_hash and nhash not in self._nodes:
+                    self._frontier.add(nhash)
+                    self._path.append((aidx, cx, cy))
+
+                if self._total_steps >= self._budget:
+                    return False
+
+                self._backtrack(cur_hash)
 
         return False
