@@ -67,7 +67,7 @@ if SRC is None: raise SystemExit("[ERR] vericoding-urm not found")
 print(f"Dataset: {{SRC}}")
 
 for fname in ["submission_agent.py", "kaggle_main.py", "wasm_bridge.py",
-              "frame_processor.py", "replay_explorer.py",
+              "frame_processor.py", "algebra_probe.py", "ida_star.py",
               "wasm_bridge.wasm", "urm_checkpoint.pt", "rhae_stage1.wasm"]:
     f = SRC / fname
     if f.exists(): shutil.copy2(f, WK / fname)

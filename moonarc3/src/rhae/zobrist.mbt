@@ -2,13 +2,13 @@
 // zobrist.mbt — Zobrist hash + Transposition Table + Visited set
 // ═══════════════════════════════════════════════════════════════
 
-let zb_rows   : Int = 32
-let zb_cols   : Int = 32
+let zb_rows   : Int = 64
+let zb_cols   : Int = 64
 let zb_colors : Int = 16
-let zb_size   : Int = 16384
+let zb_size   : Int = 65536
 
-let zt_lo   : Array[Int]  = Array::make(16384, 0)
-let zt_hi   : Array[Int]  = Array::make(16384, 0)
+let zt_lo   : Array[Int]  = Array::make(zb_size, 0)
+let zt_hi   : Array[Int]  = Array::make(zb_size, 0)
 let zt_init : Ref[Bool]   = { val: false }
 
 fn splitmix_lo(s : Int) -> Int {
