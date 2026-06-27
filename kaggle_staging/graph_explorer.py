@@ -35,13 +35,21 @@ class NodeInfo:
 
 class GraphExplorer:
     # Heuristic weights (manual, 0 params, no training)
+    # Can be overridden per-instance for adaptive search
     W_TIER    = 10.0  # priority tier (G0=5 → 50pts, G4=1 → 10pts)
     W_AREA    = 5.0   # coverage area (larger = more likely target)
     W_NOVELTY = 3.0   # never tried in any state = bonus
+
+    # Default weight configs for adaptive search
+    WEIGHT_CONFIGS = [
+        {"W_TIER": 10, "W_AREA": 5,  "W_NOVELTY": 3},   # salience-first (default)
+        {"W_TIER": 5,  "W_AREA": 5,  "W_NOVELTY": 10},  # novelty-first (explore)
+        {"W_TIER": 15, "W_AREA": 3,  "W_NOVELTY": 2},   # tier-first (conservative)
+    ]
     W_WASM    = 1.0   # WASM build_candidates score (0-100)
 
     def __init__(self, env, fp, hasher, action_list, tt_lookup=None, tt_store=None,
-                 wasm_scorer=None):
+                 wasm_scorer=None, weights=None):
         self._env = env
         self._fp = fp
         self._hasher = hasher
@@ -50,7 +58,9 @@ class GraphExplorer:
         self._simple_indices = [i for i, a in enumerate(self._actions) if not a.is_complex()]
         self._tt_lk = tt_lookup
         self._tt_st = tt_store
-        self._wasm_scorer = wasm_scorer  # fn(cx, cy) → score or None
+        self._wasm_scorer = wasm_scorer
+        # Instance weights (overridable for adaptive search)
+        self._weights = weights or {"W_TIER": 10.0, "W_AREA": 5.0, "W_NOVELTY": 3.0}  # fn(cx, cy) → score or None
 
         self._nodes = {}
         self._edges = {}
@@ -58,12 +68,30 @@ class GraphExplorer:
         self._path = []
         self._distances = {}
         self._global_tried = set()  # all (cx, cy) tried across states
+        self._counter_mask = None  # volatile pixel mask (detected via detect_counter_mask)
+        self._prefix = {}  # hash -> [(a,cx,cy)...] prefix to reach each state
         self._total_steps = 0
         self._budget = 0
         self.solution = None
 
     def _grid_hash(self, grid):
+        """Hash with counter mask (volatile pixels zeroed)."""
+        if self._counter_mask is not None and self._counter_mask.shape == grid.shape:
+            masked = grid.copy()
+            masked[self._counter_mask] = 0
+            return self._hasher(masked)
         return self._hasher(grid)
+
+    def _backtrack(self, to_hash):
+        """Reset env and replay prefix to reach to_hash."""
+        prefix = self._prefix.get(to_hash, [])
+        self._env.reset()
+        for aidx, cx, cy in prefix:
+            ga = self._actions[aidx]
+            gd = {"x": cx, "y": cy} if ga.is_complex() else None
+            nf = self._env.step(ga, data=gd)
+            if nf is None:
+                break
 
     def _step(self, action_idx, cx=32, cy=32):
         self._total_steps += 1
@@ -100,6 +128,10 @@ class GraphExplorer:
         if fr is None or len(fr) == 0:
             return []
         grid = np.asarray(fr[0], dtype=np.int32)
+        # Apply counter mask before segmentation (zero out volatile pixels)
+        if self._counter_mask is not None and self._counter_mask.shape == grid.shape:
+            grid = grid.copy()
+            grid[self._counter_mask] = 0
         label_map, components = self._fp.segment_frame(grid)
         groups = self._fp.frame_segments_to_action_groups(components, 5)
         result = []
@@ -113,10 +145,11 @@ class GraphExplorer:
         return result
 
     def _score_candidate(self, tier, cx, cy, area, max_area):
-        """Heuristic confidence score for a candidate (0 params, manual weights)."""
-        tier_score = (5 - tier) * self.W_TIER         # G0=50, G4=10
-        area_norm = (area / max(1, max_area)) * self.W_AREA  # 0-W_AREA
-        novelty = self.W_NOVELTY if (cx, cy) not in self._global_tried else 0.0
+        """Heuristic confidence score using instance weights."""
+        w = self._weights
+        tier_score = (5 - tier) * w["W_TIER"]
+        area_norm = (area / max(1, max_area)) * w["W_AREA"]
+        novelty = w["W_NOVELTY"] if (cx, cy) not in self._global_tried else 0.0
         return tier_score + area_norm + novelty
 
     def _get_or_create_node(self, s_hash, frame):
@@ -192,6 +225,7 @@ class GraphExplorer:
         self._path.clear()
         self._distances.clear()
         self._global_tried.clear()
+        self._prefix.clear()
         self.solution = None
 
         self._env.reset()
@@ -201,6 +235,91 @@ class GraphExplorer:
         grid = self._get_grid(frame)
         start_hash = self._grid_hash(grid)
         self._frontier.add(start_hash)
+
+        # ── Adaptive weight search (3 configs × 50 steps = 150 step budget) ──
+        _best_weights = self._weights
+        _best_count = -1
+        _trial_budget = min(50, max_steps // 10)
+        if _trial_budget >= 10 and not self._simple_indices:
+            for _cfg_idx, _cfg in enumerate(self.WEIGHT_CONFIGS):
+                if self._total_steps >= max_steps * 0.75:
+                    break
+                self._weights = _cfg
+                self._nodes.clear()
+                self._edges.clear()
+                self._frontier.clear()
+                self._path.clear()
+                self._distances.clear()
+                self._global_tried.clear()
+                self._prefix.clear()
+                self._env.reset()
+                frame = self._step(0)
+                if frame is None:
+                    self._weights = _best_weights
+                    break
+                grid = self._get_grid(frame)
+                sh = self._grid_hash(grid)
+                self._frontier.add(sh)
+                _found = 0
+                # Run _trial_budget steps with this config
+                _trial_steps = 0
+                _prev_budget = self._budget
+                self._budget = self._total_steps + _trial_budget
+                while self._total_steps < self._budget and self._frontier:
+                    self._rebuild_distances()
+                    ordered = sorted(self._frontier, key=lambda h: -self._distances.get(h, 0))
+                    if not ordered:
+                        break
+                    cur_h = ordered[0]
+                    cn = self._nodes.get(cur_h)
+                    if cn and cn.is_dead:
+                        self._frontier.discard(cur_h)
+                        continue
+                    cs = self._next_untried(cur_h)
+                    if cs is None:
+                        self._frontier.discard(cur_h)
+                        continue
+                    aidx, cx, cy = cs
+                    nf = self._step(aidx, cx, cy)
+                    if nf is None:
+                        continue
+                    ng = self._get_grid(nf)
+                    nh = self._grid_hash(ng)
+                    sk = cx * 1000 + cy
+                    self._edges[(cur_h, sk)] = (nh, nf)
+                    if nh != cur_h and nh not in self._nodes:
+                        self._frontier.add(nh)
+                        _found += 1
+                self._budget = _prev_budget
+                if _found > _best_count:
+                    _best_count = _found
+                    _best_weights = dict(_cfg)
+                    if _found >= 3:
+                        break  # good enough
+            self._weights = _best_weights
+
+        # Reset for main exploration with winning weights
+        self._nodes.clear()
+        self._edges.clear()
+        self._frontier.clear()
+        self._path.clear()
+        self._distances.clear()
+        self._global_tried.clear()
+        self._prefix.clear()
+        self._env.reset()
+        frame = self._step(0)
+        if frame is None:
+            return False
+        grid = self._get_grid(frame)
+        start_hash = self._grid_hash(grid)
+        self._frontier.add(start_hash)
+
+        # ── Counter mask: detect volatile pixels (timer/score) ──
+        _frame2 = self._step(0, 32, 32)
+        if _frame2 is not None:
+            _g1 = self._get_grid(frame)
+            _g2 = self._get_grid(_frame2)
+            self._counter_mask = self._fp.detect_counter_mask(_g1, _g2)
 
         while self._total_steps < self._budget:
             if not self._frontier:
@@ -246,6 +365,7 @@ class GraphExplorer:
                 if nhash != cur_hash and nhash not in self._nodes:
                     self._frontier.add(nhash)
                     self._path.append((aidx, cx, cy))
+                    self._prefix[nhash] = self._prefix.get(cur_hash, []) + [(aidx, cx, cy)]
 
                 if self._total_steps >= self._budget:
                     return False
