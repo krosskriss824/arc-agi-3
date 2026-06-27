@@ -22,12 +22,13 @@ from typing import Any
 
 
 class NodeInfo:
-    __slots__ = ("group_of", "candidates", "tried_mask", "tried_simple", "edge_data", "is_dead")
+    __slots__ = ("group_of", "candidates", "tried_mask", "dead_mask", "tried_simple", "edge_data", "is_dead")
     def __init__(self, group_of, candidates):
         # group_of[i] = priority tier 0-4 for candidate i
         self.group_of = group_of
         self.candidates = candidates  # [(cx, cy, sid, area), ...]
         self.tried_mask = 0  # bit i = 1 if candidate i tried
+        self.dead_mask = 0   # bit i = 1 if candidate produced no state change
         self.tried_simple = 0
         self.edge_data = {}
         self.is_dead = False
@@ -191,7 +192,7 @@ class GraphExplorer:
         best_idx = -1
         best_score = -9999.0
         for i in range(len(node.candidates)):
-            if not (node.tried_mask >> i & 1):
+            if not (node.tried_mask >> i & 1) and not (node.dead_mask >> i & 1):
                 cx, cy, sid, area = node.candidates[i]
                 gid = node.group_of[i]
                 max_area = max(a for _, _, _, a in node.candidates) if node.candidates else 1
@@ -361,6 +362,13 @@ class GraphExplorer:
 
                 seg_key = cx * 1000 + cy
                 self._edges[(cur_hash, seg_key)] = (nhash, nf)
+
+                if nhash == cur_hash:
+                    # Dead action: no state change, ban this candidate
+                    for _i, (_cx, _cy, _, _) in enumerate(cur_node.candidates):
+                        if _cx == cx and _cy == cy:
+                            cur_node.dead_mask |= 1 << _i
+                            break
 
                 if nhash != cur_hash and nhash not in self._nodes:
                     self._frontier.add(nhash)
