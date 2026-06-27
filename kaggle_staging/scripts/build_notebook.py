@@ -210,6 +210,11 @@ arc       = Arcade()
 env_infos = list(arc.available_environments)
 print(f"Games: {len(env_infos)}")
 
+# Action mapping: arcengine GameAction is regular Enum (not IntEnum)
+_ACTIONS = [_GE.GameAction.ACTION1, _GE.GameAction.ACTION2, _GE.GameAction.ACTION3,
+            _GE.GameAction.ACTION4, _GE.GameAction.ACTION5, _GE.GameAction.ACTION6,
+            _GE.GameAction.ACTION7]
+
 MAX_STEPS = 200
 BFS_DEPTH = 12; BFS_BUDGET = 5000
 TTT_STEPS = 30; TTT_LR = 8e-5; TTT_LAMBDA = 0.1
@@ -264,7 +269,7 @@ for idx, env_info in enumerate(env_infos):
                         tok = wm.encode_state(grid, int(a))
                         sbuf.append(tok.squeeze(0).cpu().numpy().astype(np.int32))
                         abuf.append(int(a)); rbuf.append(0.0)
-                ga = _GE.GameAction(a + 1)
+                ga = _ACTIONS[a]
                 nf = env.step(ga)
                 if nf is None: break
                 r_ = float(getattr(nf, "levels_completed", 0) - getattr(frame, "levels_completed", 0))
@@ -280,7 +285,7 @@ for idx, env_info in enumerate(env_infos):
             _tried_two = []
             for _test_a in range(min(2, n_acts)):
                 env.reset()
-                _test_f = env.step(_GE.GameAction(_test_a + 1))
+                _test_f = env.step(_ACTIONS[_test_a])
                 if _test_f is not None:
                     _g = extract_grid(_test_f)
                     if _g is not None: _tried_two.append(_g)

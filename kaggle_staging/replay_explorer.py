@@ -58,7 +58,7 @@ class ReplayExplorer:
 
     __slots__ = (
         "_env", "_hasher", "_n_actions", "_max_depth", "_action_budget",
-        "_step_modulus",
+        "_step_modulus", "_action_list",
         "_state_prefix", "_edges", "_tried", "_processed",
         "_current_prefix", "_initial_hash",
         "_effective_actions",
@@ -87,6 +87,11 @@ class ReplayExplorer:
         self._processed: set[int] = set()
         self._current_prefix: list[int] = []
         self._initial_hash: int = 0
+        # Build action mapping: arcengine GameAction is regular Enum (not IntEnum)
+        self._action_list = [
+            _GA.ACTION1, _GA.ACTION2, _GA.ACTION3, _GA.ACTION4,
+            _GA.ACTION5, _GA.ACTION6, _GA.ACTION7,
+        ]
         # Stats
         self._effective_actions: set[int] = set(range(n_actions))
         self._winning_combos: list[list[int]] = []
@@ -172,9 +177,8 @@ class ReplayExplorer:
 
     def _to_ga(self, a: int) -> _GA:
         """Convert 0-based action index to GameAction."""
-        ga = _GA(a + 1)  # 0-based → 1-based
+        ga = self._action_list[a] if 0 <= a < 7 else _GA.RESET
         if ga.is_complex() and a == 5:  # ACTION6 = index 5
-            # Default click at (32, 32) — caller can override
             ga.set_data({"x": 32, "y": 32})
         return ga
 
