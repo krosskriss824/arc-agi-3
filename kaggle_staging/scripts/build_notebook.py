@@ -210,13 +210,8 @@ arc       = Arcade()
 env_infos = list(arc.available_environments)
 print(f"Games: {len(env_infos)}")
 
-# Action mapping: arcengine GameAction is regular Enum (not IntEnum)
-_ACTIONS = [_GE.GameAction.ACTION1, _GE.GameAction.ACTION2, _GE.GameAction.ACTION3,
-            _GE.GameAction.ACTION4, _GE.GameAction.ACTION5, _GE.GameAction.ACTION6,
-            _GE.GameAction.ACTION7]
-
 MAX_STEPS = 200
-BFS_DEPTH = 12; BFS_BUDGET = 5000
+BFS_DEPTH = 16; BFS_BUDGET = 15000
 TTT_STEPS = 30; TTT_LR = 8e-5; TTT_LAMBDA = 0.1
 trajectories, game_scores = {}, {}
 bfs_results = {}  # gid → (solved, n_actions, n_bfs_actions)
@@ -247,20 +242,69 @@ for idx, env_info in enumerate(env_infos):
 
         # ── v21: ReplayExplorer BFS with reset-replay ──
         hasher = agent.get_hasher()
-        n_acts = max(getattr(agent, "_n_actions", 7), 1)
+        # Use env.action_space for direct step calls
+        _act_list = getattr(env, "action_space", None)
+        if not _act_list or len(_act_list) == 0:
+            _act_list = [_GE.GameAction.ACTION1, _GE.GameAction.ACTION2,
+                         _GE.GameAction.ACTION3, _GE.GameAction.ACTION4,
+                         _GE.GameAction.ACTION5, _GE.GameAction.ACTION6,
+                         _GE.GameAction.ACTION7]
+        # Pre-BFS: detect volatile pixels from 2 distinct actions
+        _vmask = None
+        _tried_two = []
+        for _test_a in [0, min(1, len(_act_list) - 1)]:
+            env.reset()
+            _test_f = env.step(_act_list[_test_a])
+            if _test_f is not None:
+                _g = extract_grid(_test_f)
+                if _g is not None: _tried_two.append(_g)
+        if len(_tried_two) == 2:
+            _vmask = _fp_counter.detect_counter_mask(_tried_two[0], _tried_two[1])
+            if hasattr(agent, '_fp_status_bar_mask') and agent._fp_status_bar_mask is not None:
+                agent._fp_status_bar_mask = agent._fp_status_bar_mask | _vmask
+        env.reset()  # restore to initial state
+        # Create explorer with optional volatile mask
         explorer = ReplayExplorer(
             env, hasher,
-            n_actions=n_acts,
+            n_actions=0,  # auto-detect from env.action_space
             max_depth=BFS_DEPTH,
             max_actions=BFS_BUDGET,
             step_modulus=3,
         )
+        if _vmask is not None:
+            explorer.set_volatile_mask(_vmask)
+        explorer.set_action6_priority()  # farmountain EXP-035: try ACTION6 first
+        # ── v22: Repeated-action probe (for games requiring ×50-200 steps) ──
+        _repeated_solution = None
+        for _ra_idx in range(min(4, len(_act_list))):
+            env.reset()
+            agent.on_game_start()
+            for _step_idx in range(MAX_STEPS):
+                nf = env.step(_act_list[_ra_idx])
+                if nf is None:
+                    break
+                if getattr(nf, "state", None) is _GS.WIN:
+                    _repeated_solution = [_ra_idx] * (_step_idx + 1)
+                    print(f"  [{idx+1}] {gid}: repeat {_act_list[_ra_idx].name}×{_step_idx+1} → WIN")
+                    break
+            if _repeated_solution:
+                break
+        if _repeated_solution:
+            bfs_solution = _repeated_solution
+            solved_by_bfs = True
+            score = 1.0
+            game_scores[gid] = score
+            bfs_results[gid] = {"solved": True, "n_actions": len(_repeated_solution), "bfs": len(_repeated_solution)}
+            _best_score = max(_best_score, score)
+            continue  # skip BFS and agent loop
+
+        env.reset()  # restore for BFS
         bfs_solution = explorer.solve()
         solved_by_bfs = bfs_solution is not None
 
         if solved_by_bfs:
             print(f"  [{idx+1}] {gid}: BFS solved in {len(bfs_solution)} actions")
-            # Execute solution
+            # Execute solution — use restored env (after explorer.reset())
             agent.on_game_start()
             for a in bfs_solution:
                 if wm is not None:
@@ -269,7 +313,7 @@ for idx, env_info in enumerate(env_infos):
                         tok = wm.encode_state(grid, int(a))
                         sbuf.append(tok.squeeze(0).cpu().numpy().astype(np.int32))
                         abuf.append(int(a)); rbuf.append(0.0)
-                ga = _ACTIONS[a]
+                ga = _act_list[a]
                 nf = env.step(ga)
                 if nf is None: break
                 r_ = float(getattr(nf, "levels_completed", 0) - getattr(frame, "levels_completed", 0))
@@ -281,19 +325,6 @@ for idx, env_info in enumerate(env_infos):
             bfs_results[gid] = {"solved": True, "n_actions": len(bfs_solution), "bfs": len(bfs_solution)}
         else:
             print(f"  [{idx+1}] {gid}: BFS exhausted, fallback to agent loop")
-            # ── Counter mask: detect volatile pixels ──
-            _tried_two = []
-            for _test_a in range(min(2, n_acts)):
-                env.reset()
-                _test_f = env.step(_ACTIONS[_test_a])
-                if _test_f is not None:
-                    _g = extract_grid(_test_f)
-                    if _g is not None: _tried_two.append(_g)
-            if len(_tried_two) == 2:
-                _vmask = _fp_counter.detect_counter_mask(_tried_two[0], _tried_two[1])
-                # Add counter mask to agent's status bar mask
-                if hasattr(agent, '_fp_status_bar_mask') and agent._fp_status_bar_mask is not None:
-                    agent._fp_status_bar_mask = agent._fp_status_bar_mask | _vmask
 
             # Standard agent loop (paper)
             env.reset()
