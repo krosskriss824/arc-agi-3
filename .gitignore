@@ -1,0 +1,6 @@
+# VERICODING - ARC-AGI-3 Solver
+.git/
+__pycache__/
+*.pyc
+.DS_Store
+*.zip

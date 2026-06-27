@@ -1,0 +1,132 @@
+// Generated using `moon info`, DON'T EDIT IT
+package "moonarc3/rhae/src/rhae"
+
+import {
+  "moonbitlang/core/ref",
+}
+
+// Values
+pub fn build_candidate_rows(Int, Array[Int], Array[Int], Int, Int, Int, Array[Int], Int) -> Int
+
+pub fn canonical_hash(Array[Int], Int, Int) -> (Int, Int)
+
+pub fn canonicalize_grid(Array[Int], Int, Int, Array[Int]) -> (Int, Int)
+
+pub fn compute_invariants(Array[Int], Array[Int], Int, Int, Array[Int]) -> Unit
+
+pub let cr_action : Int
+
+pub let cr_canon_hash : Int
+
+pub let cr_dyn_0 : Int
+
+pub let cr_geom_0 : Int
+
+pub let cr_geom_1 : Int
+
+pub let cr_goal_0 : Int
+
+pub let cr_info_gain : Int
+
+pub let cr_novelty : Int
+
+pub let cr_parent_hash : Int
+
+pub let cr_path_cost : Int
+
+pub let cr_revisit_risk : Int
+
+pub let cr_stride : Int
+
+pub let cr_topo_0 : Int
+
+pub let cr_topo_1 : Int
+
+pub fn decode_action(Int) -> Int
+
+pub fn encode_action(Int) -> Int
+
+pub fn get_inv(Int) -> Int
+
+pub fn get_mat(Int) -> Int
+
+pub fn get_topk(Int) -> Int
+
+pub let grid_buf : Array[Int]
+
+pub let hash_hi : @ref.Ref[Int]
+
+pub let inv_buf : Array[Int]
+
+pub let mat_buf : Array[Int]
+
+pub fn normalize_colors(Array[Int], Int, Array[Int]) -> Int
+
+pub fn policy_gate(Int, Array[Int], Array[Int], Int, Int, Array[Int], Int) -> Int
+
+pub let prev_buf : Array[Int]
+
+pub fn rhae_build_candidates(Int, Int, Int, Int, Int) -> Int
+
+pub fn rhae_canonical_hash(Int, Int) -> Int
+
+pub fn rhae_get_hash_hi() -> Int
+
+pub fn rhae_hash_and_check(Int, Int) -> Int
+
+pub fn rhae_invariants(Int, Int) -> Int
+
+pub fn rhae_policy_gate(Int, Int, Int, Int) -> Int
+
+pub fn rhae_topk(Int, Int) -> Int
+
+pub fn rhae_tt_lookup(Int, Int) -> Int
+
+pub fn rhae_tt_store(Int, Int, Int, Int) -> Unit
+
+pub fn rhae_visited_check(Int, Int) -> Int
+
+pub fn rhae_visited_mark(Int, Int) -> Unit
+
+pub fn rhae_visited_reset() -> Unit
+
+pub let risk_buf : Array[Int]
+
+pub fn set_grid_cell(Int, Int) -> Unit
+
+pub fn set_prev_cell(Int, Int) -> Unit
+
+pub fn set_risk(Int, Int) -> Unit
+
+pub fn set_visited(Int, Int) -> Unit
+
+pub let topk_buf : Array[Int]
+
+pub fn topk_candidates(Array[Int], Int, Int, Array[Int]) -> Int
+
+pub fn tt_lookup(Int, Int) -> (Bool, Int, Int)
+
+pub fn tt_store(Int, Int, Int, Int) -> Unit
+
+pub let vis_buf : Array[Int]
+
+pub fn visited_check(Int, Int) -> Bool
+
+pub fn visited_mark(Int, Int) -> Unit
+
+pub fn visited_reset() -> Unit
+
+pub fn zobrist_hash_grid(Array[Int], Int, Int) -> (Int, Int)
+
+pub fn zobrist_init() -> Unit
+
+pub fn zobrist_update_cell(Int, Int, Int, Int, Int, Int) -> (Int, Int)
+
+// Errors
+
+// Types and methods
+
+// Type aliases
+
+// Traits
+
