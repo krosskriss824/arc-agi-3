@@ -139,7 +139,9 @@ class ReplayExplorer:
                     if self._action_budget <= 0:
                         return None
 
-                    nf = self._env.step(self._to_ga(a))
+                    ga = self._action_list[a]
+                    ga_data = {"x": 32, "y": 32} if ga.is_complex() else None
+                    nf = self._env.step(ga, data=ga_data)
                     self._action_budget -= 1
                     new_hash = self._hash_frame(nf, depth + 1)
 
@@ -191,11 +193,13 @@ class ReplayExplorer:
         return lo
 
     def _to_ga(self, a: int) -> _GA:
-        """Convert 0-based action index to GameAction by looking up in action_list."""
-        ga = self._action_list[a] if 0 <= a < self._n_actions else _GA.RESET
-        if ga.is_complex():
-            ga.set_data({"x": 32, "y": 32})
-        return ga
+        """Convert 0-based action index to GameAction by looking up in action_list.
+        
+        NOTE: data must be passed as env.step(ga, data=...) kwarg, NOT via
+        ga.set_data(), because set_data creates a Pydantic ComplexAction object
+        which is not subscriptable (games access data as dict['x']).
+        """
+        return self._action_list[a] if 0 <= a < self._n_actions else _GA.RESET
 
     def _replay_to(self, target_prefix: list[int]) -> None:
         """True incremental replay: only replay delta from longest common prefix.
@@ -218,13 +222,17 @@ class ReplayExplorer:
         if common == len(cp):
             # Current is a prefix of target → no reset needed, just replay suffix
             for a in target_prefix[common:]:
-                self._env.step(self._to_ga(a))
+                ga = self._action_list[a]
+                gd = {"x": 32, "y": 32} if ga.is_complex() else None
+                self._env.step(ga, data=gd)
                 self._action_budget -= 1
         else:
             # Diverged from target → reset to initial + replay up to LCP + delta
             self._env.reset()
             for a in target_prefix:
-                self._env.step(self._to_ga(a))
+                ga = self._action_list[a]
+                gd = {"x": 32, "y": 32} if ga.is_complex() else None
+                self._env.step(ga, data=gd)
                 self._action_budget -= 1
         self._current_prefix = target_prefix[:]
 

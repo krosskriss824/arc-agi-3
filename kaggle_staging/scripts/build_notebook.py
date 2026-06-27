@@ -280,12 +280,14 @@ for idx, env_info in enumerate(env_infos):
             env.reset()
             agent.on_game_start()
             for _step_idx in range(MAX_STEPS):
-                nf = env.step(_act_list[_ra_idx])
+                _ga = _act_list[_ra_idx]
+                _gd = {"x": 32, "y": 32} if _ga.is_complex() else None
+                nf = env.step(_ga, data=_gd)
                 if nf is None:
                     break
                 if getattr(nf, "state", None) is _GS.WIN:
                     _repeated_solution = [_ra_idx] * (_step_idx + 1)
-                    print(f"  [{idx+1}] {gid}: repeat {_act_list[_ra_idx].name}×{_step_idx+1} → WIN")
+                    print(f"  [{idx+1}] {gid}: repeat {_ga.name}*{_step_idx+1} -> WIN")
                     break
             if _repeated_solution:
                 break
@@ -314,7 +316,8 @@ for idx, env_info in enumerate(env_infos):
                         sbuf.append(tok.squeeze(0).cpu().numpy().astype(np.int32))
                         abuf.append(int(a)); rbuf.append(0.0)
                 ga = _act_list[a]
-                nf = env.step(ga)
+                gd = {"x": 32, "y": 32} if ga.is_complex() else None
+                nf = env.step(ga, data=gd)
                 if nf is None: break
                 r_ = float(getattr(nf, "levels_completed", 0) - getattr(frame, "levels_completed", 0))
                 score += r_
