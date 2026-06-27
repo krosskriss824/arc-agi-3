@@ -193,17 +193,17 @@ else:
     print("[GPU] CPU only")
 ''')
 
-# ── Cell 4: Phase A - ReplayExplorer BFS + Counter Mask + Optional TTT ──
+# ── Cell 4: Phase A - Algebra Probe Pipeline + Counter Mask + Optional TTT ──
 CELL_4 = textwrap.dedent('''\
 # ═══════════════════════════════════════════════════════════════
-# CELL 4: Phase A - ReplayExplorer BFS + Counter Mask
+# CELL 4: Phase A - Algebra Probe Pipeline + Counter Mask
 # ═══════════════════════════════════════════════════════════════
 os.environ.setdefault("OPERATION_MODE", "offline")
 os.environ.setdefault("ENVIRONMENTS_DIR", str(SRC / "environment_files"))
 from arc_agi import Arcade
 from arcengine import GameState as _GS, enums as _GE
 from wasm_bridge import functional_ttt_train, _extract_head_params, _extract_buffers, pure_batch_ttt_loss
-from replay_explorer import ReplayExplorer
+import algebra_probe as _ap
 from frame_processor import FrameProcessor
 
 arc       = Arcade()
@@ -211,10 +211,9 @@ env_infos = list(arc.available_environments)
 print(f"Games: {len(env_infos)}")
 
 MAX_STEPS = 200
-BFS_DEPTH = 16; BFS_BUDGET = 15000
 TTT_STEPS = 30; TTT_LR = 8e-5; TTT_LAMBDA = 0.1
 trajectories, game_scores = {}, {}
-bfs_results = {}  # gid → (solved, n_actions, n_bfs_actions)
+bfs_results = {}  # gid → (solved, n_actions, budget_used)
 _best_score = 0.0
 t0 = time.time()
 
@@ -240,102 +239,56 @@ for idx, env_info in enumerate(env_infos):
         if frame is None: continue
         agent.on_game_start()
 
-        # ── v21: ReplayExplorer BFS with reset-replay ──
+        # ── v22: Algebra Probe Pipeline (replaces BFS entirely) ──
         hasher = agent.get_hasher()
-        # Use env.action_space for direct step calls
-        _act_list = getattr(env, "action_space", None)
-        if not _act_list or len(_act_list) == 0:
+        import algebra_probe as _ap
+        _ap.set_hasher(hasher)
+        _act_list = list(getattr(env, "action_space", []))
+        if not _act_list:
             _act_list = [_GE.GameAction.ACTION1, _GE.GameAction.ACTION2,
                          _GE.GameAction.ACTION3, _GE.GameAction.ACTION4,
                          _GE.GameAction.ACTION5, _GE.GameAction.ACTION6,
                          _GE.GameAction.ACTION7]
-        # Pre-BFS: detect volatile pixels from 2 distinct actions
-        _vmask = None
-        _tried_two = []
-        for _test_a in [0, min(1, len(_act_list) - 1)]:
-            env.reset()
-            _test_f = env.step(_act_list[_test_a])
-            if _test_f is not None:
-                _g = extract_grid(_test_f)
-                if _g is not None: _tried_two.append(_g)
-        if len(_tried_two) == 2:
-            _vmask = _fp_counter.detect_counter_mask(_tried_two[0], _tried_two[1])
-            if hasattr(agent, '_fp_status_bar_mask') and agent._fp_status_bar_mask is not None:
-                agent._fp_status_bar_mask = agent._fp_status_bar_mask | _vmask
-        env.reset()  # restore to initial state
-        # Create explorer with optional volatile mask
-        explorer = ReplayExplorer(
-            env, hasher,
-            n_actions=0,  # auto-detect from env.action_space
-            max_depth=BFS_DEPTH,
-            max_actions=BFS_BUDGET,
-            step_modulus=3,
-        )
-        if _vmask is not None:
-            explorer.set_volatile_mask(_vmask)
-        explorer.set_action6_priority()  # farmountain EXP-035: try ACTION6 first
-        # ── v22: Repeated-action probe (priority order: ACTION6 ≥ ACTION1 ≥ ACTION2 ≥ ...) ──
-        _RA_PRIORITY = (
-            [i for i, g in enumerate(_act_list) if g.name == "ACTION6"]
-            + [i for i, g in enumerate(_act_list) if g.name == "ACTION1"]
-            + [i for i, g in enumerate(_act_list) if g.name == "ACTION2"]
-            + [i for i, g in enumerate(_act_list) if g.name == "ACTION3"]
-        )[:6]
-        _repeated_solution = None
-        for _ra_idx in _RA_PRIORITY:
-            env.reset()
-            agent.on_game_start()
-            for _step_idx in range(MAX_STEPS):
-                _ga = _act_list[_ra_idx]
-                _gd = {"x": 32, "y": 32} if _ga.is_complex() else None
-                nf = env.step(_ga, data=_gd)
-                if nf is None:
+        env.reset()
+        agent.on_game_start()
+        _algebra_tags = _ap.probe_action_algebra(env, max_probe_steps=2500)
+        _strategy = _ap.choose_strategy(_algebra_tags, len(_act_list))
+        print(f"  [{idx+1}] {gid}: {_strategy['reason']} ({_strategy['name']}, "
+              f"indices={_strategy['action_indices']}, "
+              f"max_steps={_strategy['max_steps']})")
+        # Execute strategy
+        _solved = False
+        _solution = None
+        if _strategy["name"] in ("blind_probe", "repeated_action", "periodic_probe"):
+            for _a_idx in _strategy["action_indices"]:
+                env.reset()
+                agent.on_game_start()
+                _ga = _act_list[_a_idx]
+                for _k in range(_strategy["max_steps"]):
+                    _gd = {"x": 32, "y": 32} if _ga.is_complex() else None
+                    _nf = env.step(_ga, data=_gd)
+                    if _nf is None:
+                        break
+                    if getattr(_nf, "state", None) is _GS.WIN:
+                        _solved = True
+                        _solution = [_a_idx] * (_k + 1)
+                        print(f"  [{idx+1}] {gid}: {_ga.name}*{_k+1} -> WIN")
+                        break
+                if _solved:
                     break
-                if getattr(nf, "state", None) is _GS.WIN:
-                    _repeated_solution = [_ra_idx] * (_step_idx + 1)
-                    print(f"  [{idx+1}] {gid}: repeat {_ga.name}*{_step_idx+1} -> WIN")
-                    break
-            if _repeated_solution:
-                break
-            if _repeated_solution:
-                bfs_solution = _repeated_solution
-                solved_by_bfs = True
-                _hba = getattr(env_info, "human_baseline_actions", len(_repeated_solution))
-                _aa = len(_repeated_solution)
-                score = min(1.15, (_hba / max(1, _aa)) ** 2)
+        elif _strategy["name"] == "ida_star":
+            # IDA* with n_components heuristic — TODO: implement in v22.1
+            pass
+        
+        if _solved and _solution:
+            _hba = getattr(env_info, "human_baseline_actions", len(_solution))
+            _aa = len(_solution)
+            score = min(1.15, (_hba / max(1, _aa)) ** 2)
             game_scores[gid] = score
-            bfs_results[gid] = {"solved": True, "n_actions": len(_repeated_solution), "bfs": len(_repeated_solution)}
+            bfs_results[gid] = {"solved": True, "n_actions": len(_solution), "bfs": len(_solution)}
             _best_score = max(_best_score, score)
-            continue  # skip BFS and agent loop
-
-        env.reset()  # restore for BFS
-        bfs_solution = explorer.solve()
-        solved_by_bfs = bfs_solution is not None
-
-        if solved_by_bfs:
-            print(f"  [{idx+1}] {gid}: BFS solved in {len(bfs_solution)} actions")
-            # Execute solution — use restored env (after explorer.reset())
-            agent.on_game_start()
-            for a in bfs_solution:
-                if wm is not None:
-                    grid = extract_grid(frame)
-                    if grid is not None:
-                        tok = wm.encode_state(grid, int(a))
-                        sbuf.append(tok.squeeze(0).cpu().numpy().astype(np.int32))
-                        abuf.append(int(a)); rbuf.append(0.0)
-                ga = _act_list[a]
-                gd = {"x": 32, "y": 32} if ga.is_complex() else None
-                nf = env.step(ga, data=gd)
-                if nf is None: break
-                r_ = float(getattr(nf, "levels_completed", 0) - getattr(frame, "levels_completed", 0))
-                score += r_
-                if rbuf: rbuf[-1] = r_
-                frame = nf
-                if getattr(frame, "state", None) is _GS.WIN: break
-            game_scores[gid] = score
-            bfs_results[gid] = {"solved": True, "n_actions": len(bfs_solution), "bfs": len(bfs_solution)}
-        else:
-            print(f"  [{idx+1}] {gid}: BFS exhausted, fallback to agent loop")
+            continue  # solved, skip agent loop
+        # Fallback: agent loop (existing code below)
 
             # Standard agent loop (paper)
             env.reset()
@@ -358,7 +311,7 @@ for idx, env_info in enumerate(env_infos):
                 frame = nf
                 if getattr(frame, "state", None) in (_GS.WIN, _GS.GAME_OVER): break
             game_scores[gid] = score
-            bfs_results[gid] = {"solved": False, "n_actions": 0, "bfs": BFS_BUDGET}
+            bfs_results[gid] = {"solved": False, "n_actions": 0, "budget_used": 2000}
 
         # ── Per-game TTT (GPU only) ──
         if len(sbuf) >= 4 and wm is not None and hasattr(wm, "to_fp16"):
@@ -393,8 +346,8 @@ for idx, env_info in enumerate(env_infos):
 
 n_traj = len(trajectories)
 mean_s = sum(game_scores.values()) / max(1, len(game_scores))
-n_solved_bfs = sum(1 for v in bfs_results.values() if v.get("solved"))
-print(f"Phase A: {n_traj}/{len(env_infos)} traj, BFS solved {n_solved_bfs}/{len(env_infos)}, mean_score={mean_s:.4f}, t={time.time()-t0:.0f}s")
+n_solved = sum(1 for v in bfs_results.values() if v.get("solved"))
+print(f"Phase A: {n_traj}/{len(env_infos)} traj, solved {n_solved}/{len(env_infos)}, mean_score={mean_s:.4f}, t={time.time()-t0:.0f}s")
 ''')
 
 # ── Cell 5: Phase B - Per-game TTT ──
@@ -509,8 +462,8 @@ print(f"[build_notebook] ACCELERATOR={ACCELERATOR} | Dataset={DATASET_SLUG}")
 # ── Also update kernel-metadata.json ──
 KM = _ROOT / "kernel-metadata.json"
 km = {
-    "id": "krisskey/arc3-urm-ttt-v21-w-replayexplorer-bfs",
-    "title": "ARC3 URM TTT v21 w/ReplayExplorer BFS",
+    "id": "krisskey/arc3-urm-ttt-v22-w-algebra-probe-pipeline",
+    "title": "ARC3 URM TTT v22 w/Algebra Probe Pipeline",
     "code_file": "submission.ipynb",
     "language": "python",
     "kernel_type": "notebook",

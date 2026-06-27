@@ -1,6 +1,6 @@
 {
-  "id": "krisskey/arc3-urm-ttt-v21-w-replayexplorer-bfs",
-  "title": "ARC3 URM TTT v21 w/ReplayExplorer BFS",
+  "id": "krisskey/arc3-urm-ttt-v22-w-algebra-probe-pipeline",
+  "title": "ARC3 URM TTT v22 w/Algebra Probe Pipeline",
   "code_file": "submission.ipynb",
   "language": "python",
   "kernel_type": "notebook",
