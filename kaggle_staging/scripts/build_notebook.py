@@ -84,6 +84,10 @@ for p in [str(WK), str(WK/"external"), str(WK/"external"/"urm")]:
 os.chdir(WK)
 print("Setup OK")
 
+# Pre-import strategy cache type (used later)
+import game_profiler as _gp
+import dense_explorer as _de
+
 # ── Install wasmtime offline from dataset wheel ──
 try:
     import wasmtime
@@ -245,8 +249,6 @@ for idx, env_info in enumerate(env_infos):
         agent.on_game_start()
 
         # ── v23: Game Profiler + DenseExplorer + StrategyCache ──
-        import game_profiler as _gp
-        import dense_explorer as _de
         _act_list = list(getattr(env, "action_space", []))
         if not _act_list:
             _act_list = [_GE.GameAction.ACTION1, _GE.GameAction.ACTION2,
