@@ -273,7 +273,7 @@ print(f"Games: {len(env_infos)} [dir: {{_ENV_DIR.name if _ENV_DIR == _COMP_ENV e
 # Arcade for game loading (make/g)
 arc = Arcade()
 
-MAX_STEPS = 2000
+MAX_STEPS = 5000
 TTT_STEPS = 30; TTT_LR = 8e-5; TTT_LAMBDA = 0.1
 
 def extract_grid(frame):
