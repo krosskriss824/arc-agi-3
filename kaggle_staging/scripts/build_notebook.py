@@ -84,14 +84,6 @@ for p in [str(WK), str(WK/"external"), str(WK/"external"/"urm")]:
 os.chdir(WK)
 print("Setup OK")
 
-# Patch submission_agent.py: guard _rhae._exp access when WASM unavailable
-_agent_py = (WK / "submission_agent.py").read_text(encoding="utf-8")
-_agent_py = _agent_py.replace(
-    'if cur_grid is not None and _state_hash and _prune_mask:',
-    'if cur_grid is not None and _state_hash and _prune_mask and _rhae._wasm_ok:'
-)
-(WK / "submission_agent.py").write_text(_agent_py, encoding="utf-8")
-
 # Discover environment files (Kaggle auto-extracts .zip in datasets)
 _env_candidates = [
     SRC / "environment_files",                     # Kaggle auto-extracted

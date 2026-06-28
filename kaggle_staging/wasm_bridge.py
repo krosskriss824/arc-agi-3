@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 import os
+from collections import defaultdict
 import numpy as np
 from functools import reduce
 
@@ -596,7 +597,7 @@ class RhaeEngine:
     def __init__(self, wasm_bytes=None):
         self._wasm_ok = False
         self._store = None
-        self._exp = None
+        self._exp = defaultdict(lambda: lambda *a, **kw: None)
         self._buf_ptr = None
         self._buf_len = 0
         if wasm_bytes is None:
