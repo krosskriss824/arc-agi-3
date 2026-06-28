@@ -419,8 +419,10 @@ if wm is None or not trajectories:
 else:
     TTT_STEPS=50; TTT_LR=1e-4; TTT_LAMBDA=0.1
     wm.train()
-    params  = {k:v.to(DEVICE).requires_grad_(True) for k,v in _extract_head_params(wm).items()}
-    buffers = {k:v.to(DEVICE) for k,v in _extract_buffers(wm).items()}
+    # TTT on CPU: URM compiled kernels incompatible with P100 (sm_60 has no sm_75+ kernels)
+    TTT_DEV = "cpu"
+    params  = {k:v.to(TTT_DEV).requires_grad_(True) for k,v in _extract_head_params(wm).items()}
+    buffers = {k:v.to(TTT_DEV) for k,v in _extract_buffers(wm).items()}
     ttt_results = {}; t_ttt = time.time()
     _cuda_ok = True  # track CUDA health
     for gid, traj in trajectories.items():
@@ -428,9 +430,9 @@ else:
             print(f"  {gid}: SKIP (CUDA corrupted)")
             continue
         try:
-            states  = torch.from_numpy(traj["states"]).long().to(DEVICE)
-            actions = torch.from_numpy(traj["actions"]).long().to(DEVICE)
-            rewards = torch.from_numpy(traj["rewards"]).float().to(DEVICE)
+            states  = torch.from_numpy(traj["states"]).long().to(TTT_DEV)
+            actions = torch.from_numpy(traj["actions"]).long().to(TTT_DEV)
+            rewards = torch.from_numpy(traj["rewards"]).float().to(TTT_DEV)
             if len(states) < 4: continue
             # Clamp actions to valid range BEFORE any CUDA loss computation
             _log_n = wm.action_head.out_features if hasattr(wm, 'action_head') else 7
