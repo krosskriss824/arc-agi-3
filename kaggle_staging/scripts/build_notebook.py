@@ -25,6 +25,7 @@ CELL_0 = textwrap.dedent(f'''\
 # ═══════════════════════════════════════════════════════════════
 import os, sys, shutil, subprocess, gc, time, json, traceback
 from pathlib import Path
+from collections import defaultdict
 import torch, numpy as np
 
 # CUDA_LAUNCH_BLOCKING=1 for accurate error line numbers (slight perf cost)
@@ -83,6 +84,34 @@ for p in [str(WK), str(WK/"external"), str(WK/"external"/"urm")]:
     if p not in sys.path: sys.path.insert(0, p)
 os.chdir(WK)
 print("Setup OK")
+
+# ── FIX v61: patch stale dataset wasm_bridge.py (_exp=None -> defaultdict) ──
+# Dataset file may be old version with _exp=None which crashes on CPU fallback.
+# Apply runtime string patch AFTER copy, BEFORE any import of wasm_bridge.
+_wb_path = WK / "wasm_bridge.py"
+if _wb_path.exists():
+    _wb_src = _wb_path.read_text(encoding="utf-8")
+    _patched = False
+    # Patch 1: bare _exp = None
+    if "_exp = None" in _wb_src and "defaultdict" not in _wb_src:
+        _wb_src = "from collections import defaultdict\\n" + _wb_src
+        _wb_src = _wb_src.replace(
+            "_exp = None",
+            "_exp = defaultdict(lambda: (lambda *a, **kw: None))"
+        )
+        _patched = True
+    # Patch 2: self._exp = None inside class body
+    if "self._exp = None" in _wb_src:
+        _wb_src = _wb_src.replace(
+            "self._exp = None",
+            "self._exp = defaultdict(lambda: (lambda *a, **kw: None))"
+        )
+        _patched = True
+    if _patched:
+        _wb_path.write_text(_wb_src, encoding="utf-8")
+        print("[patch] wasm_bridge.py: _exp=None -> defaultdict noop (stale dataset fix)")
+    else:
+        print("[patch] wasm_bridge.py: no patch needed")
 
 # Discover environment files (Kaggle auto-extracts .zip in datasets)
 _env_candidates = [
@@ -261,7 +290,7 @@ for _mf in sorted(_ENV_DIR.rglob("metadata.json")):
     _jd = json.loads(_mf.read_text(encoding="utf-8"))
     _jd["local_dir"] = str(_mf.parent)
     env_infos.append(EnvironmentInfo.model_validate(_jd))
-print(f"Games: {len(env_infos)} [dir: {{_ENV_DIR.name if _ENV_DIR == _COMP_ENV else 'dataset'}}]")
+print(f"Games: {len(env_infos)} [dir: {_ENV_DIR.name if _ENV_DIR == _COMP_ENV else 'dataset'}]")
 
 # Arcade for game loading (make/g)
 arc = Arcade()
@@ -279,7 +308,7 @@ def extract_grid(frame):
 
 def _frame_win(nf):
     s = getattr(nf, "state", None) if nf is not None else None
-    return s is not None and ("WIN" in str(s) or (hasattr(s, 'value') and str(s.value) == "WIN"))
+    return s is not None and ("WIN" in str(s) or (hasattr(s, \'value\') and str(s.value) == "WIN"))
 
 game_scores, bfs_results, trajectories = {}, {}, {}
 _best_score = 0.0
@@ -301,8 +330,9 @@ for idx, env_info in enumerate(env_infos):
         _frames = [env.reset()]
         if _frames[0] is None: continue
         agent.on_game_start()
-        
+
         # ── DenseExplorer pre-scan: find live clicks (200 steps budget) ──
+        _hint_xy = None
         _de_inst = _de.DenseExplorer(env, _act_list)
         if _de_inst._click_idx is not None:
             _de_inst.explore(max_steps=200)
@@ -326,20 +356,19 @@ for idx, env_info in enumerate(env_infos):
                     print(f"  [{idx+1}] {gid}: score={score:.4f}, steps={len(_frames)-1} [DenseExplorer]")
                     _best_score = max(_best_score, score)
                     continue
-        else:
-            _hint_xy = None
-        
-        # Reset env after DenseExplorer pre-scan (env may be desynced)
+
+        # FIX v61: always reset after DenseExplorer (env desynced after explore())
         _frames = [env.reset()]
-        
+        if _frames[0] is None: continue
+
         for _ in range(MAX_STEPS):
             act = agent.choose_action(_frames, None)
-            _act_data = getattr(agent, '_last_action_data', None)
+            _act_data = getattr(agent, \'_last_action_data\', None)
             _pframe = _frames[-1]
             if wm is not None:
                 grid = extract_grid(_pframe)
                 if grid is not None:
-                    _aid = act.value[0] if isinstance(getattr(act, 'value', None), tuple) else getattr(act, 'value', 0)
+                    _aid = act.value[0] if isinstance(getattr(act, \'value\', None), tuple) else getattr(act, \'value\', 0)
                     tok = wm.encode_state(grid, _aid)
                     sbuf.append(tok.squeeze(0).cpu().numpy().astype(np.int32))
                     abuf.append(_aid); rbuf.append(0.0)
@@ -427,7 +456,7 @@ else:
             rewards = torch.from_numpy(traj["rewards"]).float().to(DEVICE)
             if len(states) < 4: continue
             # Clamp actions to valid range BEFORE any CUDA loss computation
-            _log_n = wm.action_head.out_features if hasattr(wm, 'action_head') else 7
+            _log_n = wm.action_head.out_features if hasattr(wm, \'action_head\') else 7
             actions = actions.clamp(0, _log_n - 1)
             next_states = torch.cat([states[1:], states[-1:]], dim=0)
             new_p = functional_ttt_train(params, buffers, wm, states, actions, next_states, rewards,
@@ -439,7 +468,7 @@ else:
             improved = aft < b4
             if improved: params = new_p
             ttt_results[gid] = {"before":b4,"after":aft,"improved":improved}
-            print(f"  {gid}: {b4:.4f}->{aft:.4f} {'Y' if improved else 'N'}")
+            print(f"  {gid}: {b4:.4f}->{aft:.4f} {\'Y\' if improved else \'N\'}")
         except RuntimeError as e:
             if "CUDA" in str(e) or "device-side assert" in str(e):
                 _cuda_ok = False
@@ -481,8 +510,8 @@ metrics = {
 METRICS_OUT.write_text(json.dumps(metrics, indent=2))
 print(f"Metrics: {METRICS_OUT}")
 print(f"=== TRAINING DONE ===")
-print(f"Pre-TTT mean: {metrics['pre_ttt_mean']:.4f}")
-print(f"Improved: {metrics['n_improved']}/{metrics['n_ttt']}")
+print(f"Pre-TTT mean: {metrics[\'pre_ttt_mean\']:.4f}")
+print(f"Improved: {metrics[\'n_improved\']}/{metrics[\'n_ttt\']}")
 
 if DEVICE == "cuda": torch.cuda.empty_cache()
 gc.collect()
@@ -516,7 +545,7 @@ km = {
     "language": "python",
     "kernel_type": "notebook",
     "is_private": True,
-    "enable_gpu": False,
+    "enable_gpu": True,
     "enable_tpu": False,
     "enable_internet": False,
     "dataset_sources": [DATASET_SLUG],
