@@ -8,6 +8,7 @@ Architecture:
 """
 import numpy as np
 from collections import deque
+from step_adapter import safe_step
 
 
 def _is_win(frame):
@@ -43,34 +44,11 @@ class DenseExplorer:
         self._total_steps = 0
         self.solution = None
         self.live_clicks = []  # [(x, y, state_hash), ...]
-        self._api_supports_data = True
-
-        # ── Smoke test: detect if env.step(ga, data=dict) works ──
-        self._test_action6()
-
-    def _test_action6(self):
-        """Detect click API support. Sets _api_supports_data flag."""
-        if self._click_idx is None:
-            return
-        ga = self._actions[self._click_idx]
-        try:
-            _ = self._env.step(ga, data={"x": 32, "y": 32})
-            self._api_supports_data = True
-        except (KeyError, TypeError, AttributeError):
-            self._api_supports_data = False
 
     def _safe_step(self, action_idx, cx=32, cy=32):
-        """Safe step: tries data=dict, falls back to bare step."""
+        """Step via step_adapter.safe_step (complex=always data, fail-fast)."""
         self._total_steps += 1
-        ga = self._actions[action_idx]
-        if not ga.is_complex():
-            return self._env.step(ga)
-        if self._api_supports_data:
-            try:
-                return self._env.step(ga, data={"x": int(cx), "y": int(cy)})
-            except (KeyError, TypeError, AttributeError):
-                self._api_supports_data = False
-        return self._env.step(ga)  # bare step without click coords
+        return safe_step(self._env, self._actions[action_idx], cx, cy)
 
     # ── Phase 1: Simple action brute ──
     def _phase1_simple_brute(self, budget):

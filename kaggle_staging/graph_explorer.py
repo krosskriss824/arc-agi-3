@@ -19,6 +19,7 @@ Strategy:
 from collections import deque
 import numpy as np
 from typing import Any
+from step_adapter import safe_step
 
 
 class NodeInfo:
@@ -93,15 +94,9 @@ class GraphExplorer:
                 break
 
     def _safe_step(self, action_idx, cx=32, cy=32):
-        """Step with KeyError 'x' fallback for Kaggle arcengine compat."""
+        """Step via step_adapter.safe_step (complex=always data, fail-fast)."""
         self._total_steps += 1
-        ga = self._actions[action_idx]
-        try:
-            if ga.is_complex():
-                return self._env.step(ga, data={"x": int(cx), "y": int(cy)})
-            return self._env.step(ga)
-        except (KeyError, TypeError, AttributeError):
-            return self._env.step(ga)
+        return safe_step(self._env, self._actions[action_idx], cx, cy)
 
     def _is_win(self, frame):
         s = getattr(frame, "state", None)

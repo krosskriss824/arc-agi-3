@@ -15,6 +15,7 @@ new values, no mutation except env.step() which is inherently stateful.
 
 import numpy as np
 from functools import reduce
+from step_adapter import safe_step
 
 # ── Hash function (WASM canonical_hash wrapper) ──
 
@@ -39,8 +40,7 @@ def _hash_after(env, action, n: int = 1) -> int:
     """Apply action n times from env.reset(), return hash."""
     env.reset()
     for _ in range(n):
-        gd = {"x": 32, "y": 32} if action.is_complex() else None
-        frame = env.step(action, data=gd)
+        frame = safe_step(env, action)
         if frame is None:
             return -1
     grid = _to_grid(frame)
@@ -110,9 +110,8 @@ def probe_action_algebra(env, max_probe_steps: int = 2500) -> frozenset:
             if i == j:
                 continue
             env.reset()
-            _ = env.step(b)
-            gd = {"x": 32, "y": 32} if a.is_complex() else None
-            frame = env.step(a, data=gd)
+            _ = safe_step(env, b)
+            frame = safe_step(env, a)
             grid = _to_grid(frame)
             if grid is None:
                 absorbing = False
@@ -153,8 +152,7 @@ def probe_action_algebra(env, max_probe_steps: int = 2500) -> frozenset:
     for i, a in enumerate(actions):
         env.reset()
         for k in range(1, 201):
-            gd = {"x": 32, "y": 32} if a.is_complex() else None
-            frame = env.step(a, data=gd)
+            frame = safe_step(env, a)
             if frame is None:
                 break
             if _is_win(frame):

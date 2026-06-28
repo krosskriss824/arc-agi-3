@@ -68,7 +68,7 @@ print(f"Dataset: {{SRC}}")
 
 for fname in ["submission_agent.py", "kaggle_main.py", "wasm_bridge.py",
               "frame_processor.py", "game_profiler.py", "dense_explorer.py",
-              "graph_explorer.py",
+              "graph_explorer.py", "step_adapter.py",
               "wasm_bridge.wasm", "urm_checkpoint.pt", "rhae_stage1.wasm"]:
     f = SRC / fname
     if f.exists(): shutil.copy2(f, WK / fname)
@@ -208,6 +208,7 @@ os.environ.setdefault("ENVIRONMENTS_DIR", str(SRC / "environment_files"))
 from arc_agi import Arcade
 from arcengine import GameState as _GS, enums as _GE
 from wasm_bridge import functional_ttt_train, _extract_head_params, _extract_buffers, pure_batch_ttt_loss
+from step_adapter import safe_step
 import graph_explorer as _ge
 import dense_explorer as _de
 from frame_processor import FrameProcessor
@@ -274,11 +275,7 @@ for idx, env_info in enumerate(env_infos):
                 agent.on_game_start()
                 _ga = _act_list[_a_idx]
                 for _k in range(_strategy["max_steps"]):
-                    _gd = {"x": 32, "y": 32} if _ga.is_complex() else None
-                    try:
-                        _nf = env.step(_ga, data=_gd)
-                    except (KeyError, TypeError, AttributeError):
-                        _nf = env.step(_ga)
+                    _nf = safe_step(env, _ga)
                     if _nf is None: break
                     if getattr(_nf, "state", None) is _GS.WIN:
                         _solved = True; _solution = [_a_idx] * (_k + 1)
@@ -347,10 +344,10 @@ for idx, env_info in enumerate(env_infos):
                         tok = wm.encode_state(grid, _aid)
                         sbuf.append(tok.squeeze(0).cpu().numpy().astype(np.int32))
                         abuf.append(_aid); rbuf.append(0.0)
-                try:
-                    nf = env.step(act, data=_act_data)
-                except (KeyError, TypeError, AttributeError):
-                    nf = env.step(act)
+                if _act_data:
+                    nf = safe_step(env, act, x=_act_data.get("x"), y=_act_data.get("y"))
+                else:
+                    nf = safe_step(env, act)
                 if nf is None: break
                 r_ = float(getattr(nf, "levels_completed", 0) - getattr(frame, "levels_completed", 0))
                 score += r_
