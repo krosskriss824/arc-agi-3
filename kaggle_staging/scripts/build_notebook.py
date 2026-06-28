@@ -249,6 +249,7 @@ from arc_agi import Arcade, EnvironmentInfo
 from arcengine import GameState as _GS, enums as _GE
 from wasm_bridge import functional_ttt_train, _extract_head_params, _extract_buffers, pure_batch_ttt_loss
 from step_adapter import safe_step
+import dense_explorer as _de
 
 # Discover games — try competition input first, then dataset environment_files
 _COMP_ENV = Path("/kaggle/input/arc-agi-3/environment_files")
@@ -300,6 +301,34 @@ for idx, env_info in enumerate(env_infos):
         _frames = [env.reset()]
         if _frames[0] is None: continue
         agent.on_game_start()
+        
+        # ── DenseExplorer pre-scan: find live clicks (200 steps budget) ──
+        _de_inst = _de.DenseExplorer(env, _act_list)
+        if _de_inst._click_idx is not None:
+            _de_inst.explore(max_steps=200)
+            _hint_xy = _de_inst.live_clicks[0][:2] if _de_inst.live_clicks else None
+            if _de_inst.solution:
+                # Solution found: replay and collect score
+                _frames = [env.reset()]
+                for _aidx in _de_inst.solution:
+                    _a = _act_list[_aidx]
+                    _cx, _cy = _hint_xy if _hint_xy else (32, 32)
+                    nf = safe_step(env, _a, x=_cx, y=_cy)
+                    if nf is None: break
+                    score += float(getattr(nf, "levels_completed", 0) - getattr(_frames[-1], "levels_completed", 0))
+                    _frames.append(nf)
+                    if _frame_win(nf) or getattr(nf, "state", None) is _GS.GAME_OVER: break
+                if _frame_win(nf):
+                    if sbuf: trajectories[gid] = {"states": np.stack(sbuf), "actions": np.array(abuf), "rewards": np.array(rbuf)}
+                    game_scores[gid] = score
+                    _nf_state = getattr(nf, "state", None)
+                    bfs_results[gid] = {"solved": _nf_state is not None and "WIN" in str(_nf_state), "n_actions": 0, "budget_used": len(_frames) - 1}
+                    print(f"  [{idx+1}] {gid}: score={score:.4f}, steps={len(_frames)-1} [DenseExplorer]")
+                    _best_score = max(_best_score, score)
+                    continue
+        else:
+            _hint_xy = None
+        
         for _ in range(MAX_STEPS):
             act = agent.choose_action(_frames, None)
             _act_data = getattr(agent, '_last_action_data', None)
