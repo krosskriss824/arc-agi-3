@@ -76,6 +76,7 @@ class GraphExplorer:
         self._total_steps = 0
         self._budget = 0
         self.solution = None
+        self._initial_done = False  # first node gets dense scan
 
     def _grid_hash(self, grid):
         """Hash with counter mask (volatile pixels zeroed)."""
@@ -123,7 +124,7 @@ class GraphExplorer:
                     self._distances[sh] = nd
                     dq.append(sh)
 
-    def _candidates_from_frame(self, frame):
+    def _candidates_from_frame(self, frame, dense_scan=False):
         fr = getattr(frame, "frame", None)
         if fr is None or len(fr) == 0:
             return []
@@ -132,27 +133,35 @@ class GraphExplorer:
         if self._counter_mask is not None and self._counter_mask.shape == grid.shape:
             grid = grid.copy()
             grid[self._counter_mask] = 0
-        label_map, components = self._fp.segment_frame(grid)
-        groups = self._fp.frame_segments_to_action_groups(components, 5)
         result = []
         has_clickable = False
-        for gid, seg_ids in enumerate(groups):
-            for sid in seg_ids:
-                if self._click_idx is None:
-                    continue
-                cx, cy = self._fp.compute_click_point(label_map, sid)
-                area = components[sid]["area"] if sid < len(components) else 1
-                # Skip background segment (all-black, area=4096) unless it's the only one
-                if area >= 3072 and len(components) > 1 and components[sid]["color"] == 0:
-                    continue
-                result.append((gid, cx, cy, sid, area))
+        if not dense_scan:
+            # Normal segment-based candidate generation
+            label_map, components = self._fp.segment_frame(grid)
+            groups = self._fp.frame_segments_to_action_groups(components, 5)
+            for gid, seg_ids in enumerate(groups):
+                for sid in seg_ids:
+                    if self._click_idx is None:
+                        continue
+                    cx, cy = self._fp.compute_click_point(label_map, sid)
+                    area = components[sid]["area"] if sid < len(components) else 1
+                    # Skip background segment (all-black, area=4096) unless it's the only one
+                    if area >= 3072 and len(components) > 1 and components[sid]["color"] == 0:
+                        continue
+                    result.append((gid, cx, cy, sid, area))
+                    has_clickable = True
+            # Dense scan fallback: if no clickable candidates (all-black grid), generate 8×8 grid
+            if not has_clickable and self._click_idx is not None:
+                for gx in range(0, 64, 8):
+                    for gy in range(0, 64, 8):
+                        result.append((3, gx, gy, -1, 1))
+        else:
+            # Dense scan: stride 2 (1024 positions) for initial state exploration
+            if self._click_idx is not None:
+                for gx in range(0, 64, 2):
+                    for gy in range(0, 64, 2):
+                        result.append((3, gx, gy, -1, 1))
                 has_clickable = True
-
-        # Dense scan fallback: if no clickable candidates (all-black grid), generate 8×8 grid
-        if not has_clickable and self._click_idx is not None:
-            for gx in range(0, 64, 8):
-                for gy in range(0, 64, 8):
-                    result.append((3, gx, gy, -1, 1))  # G3 = non-salient
         return result
 
     def _score_candidate(self, tier, cx, cy, area, max_area):
@@ -165,7 +174,9 @@ class GraphExplorer:
 
     def _get_or_create_node(self, s_hash, frame):
         if s_hash not in self._nodes:
-            cands = self._candidates_from_frame(frame)
+            use_dense = not self._initial_done
+            self._initial_done = True
+            cands = self._candidates_from_frame(frame, dense_scan=use_dense)
             groups_list = [[] for _ in range(5)]
             areas = {}
             for gid, cx, cy, sid, area in cands:
@@ -332,11 +343,20 @@ class GraphExplorer:
         self._get_or_create_node(start_hash, frame)
 
         # ── Counter mask: detect volatile pixels (timer/score) ──
-        _frame2 = self._safe_step(0, 32, 32)
-        if _frame2 is not None:
-            _g1 = self._get_grid(frame)
-            _g2 = self._get_grid(_frame2)
-            self._counter_mask = self._fp.detect_counter_mask(_g1, _g2)
+        # Occam technique: take frame after two DIFFERENT actions,
+        # pixels that changed in BOTH are volatile (timer, score).
+        if len(self._actions) > 1:
+            _act0 = self._safe_step(0, 32, 32)
+            _g0 = self._get_grid(_act0) if _act0 is not None else None
+            self._backtrack(start_hash)
+            _act1 = self._safe_step(1, 32, 32) if len(self._actions) > 1 else None
+            _g1 = self._get_grid(_act1) if _act1 is not None else None
+            if _g0 is not None and _g1 is not None:
+                _mask0 = (grid != _g0)
+                _mask1 = (grid != _g1)
+                self._counter_mask = (_mask0 & _mask1)
+        # Reset env to initial state before main loop
+        self._backtrack(start_hash)
 
         while self._total_steps < self._budget:
             if not self._frontier:
@@ -354,6 +374,7 @@ class GraphExplorer:
                 continue
 
             self._backtrack(cur_hash)
+            _tries_here = 0
 
             # ── TRY ALL CANDIDATES AT THIS STATE ──
             while True:

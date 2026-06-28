@@ -84,6 +84,41 @@ for p in [str(WK), str(WK/"external"), str(WK/"external"/"urm")]:
 os.chdir(WK)
 print("Setup OK")
 
+# Patch submission_agent.py: guard _rhae._exp access when WASM unavailable
+_agent_py = (WK / "submission_agent.py").read_text(encoding="utf-8")
+_agent_py = _agent_py.replace(
+    'if cur_grid is not None and _state_hash and _prune_mask:',
+    'if cur_grid is not None and _state_hash and _prune_mask and _rhae._wasm_ok:'
+)
+(WK / "submission_agent.py").write_text(_agent_py, encoding="utf-8")
+
+# Discover environment files (Kaggle auto-extracts .zip in datasets)
+_env_candidates = [
+    SRC / "environment_files",                     # Kaggle auto-extracted
+    WK / "environment_files",                      # manually extracted (legacy)
+]
+for _ecd in _env_candidates:
+    if _ecd.is_dir() and len(list(_ecd.rglob("metadata.json"))) > 0:
+        os.environ.setdefault("ENVIRONMENTS_DIR", str(_ecd))
+        _n_meta = len(list(_ecd.rglob("metadata.json")))
+        print(f"ENV: {{_ecd.name}} ({{_n_meta}} games)")
+        break
+else:
+    # Last resort: extract from dataset zip
+    _env_zip = SRC / "environment_files.zip"
+    if _env_zip.exists():
+        import zipfile
+        with zipfile.ZipFile(_env_zip) as zf:
+            zf.extractall(WK / "environment_files")
+        _ed = WK / "environment_files"
+        if _ed.is_dir():
+            os.environ.setdefault("ENVIRONMENTS_DIR", str(_ed))
+            _n_meta = len(list(_ed.rglob("metadata.json")))
+            print(f"Extracted: {{_n_meta}} games to WK/environment_files")
+    else:
+        os.environ.setdefault("ENVIRONMENTS_DIR", str(SRC / "environment_files"))
+        print(f"ENV_DIR: {{os.environ['ENVIRONMENTS_DIR']}}")
+
 # Strategy cache type (persists across all games)
 import game_profiler as _gp
 _strategy_cache = _gp.StrategyCache()
@@ -116,26 +151,34 @@ def install_arc_agi():
     try:
         import arc_agi; print("arc-agi OK"); return
     except ImportError: pass
-    # Candidate wheel directories
-    _cand = [
-        SRC / "arc_wheels",               # 1. dataset offline wheels dir
-        Path("{COMP_PATH}") / "arc_agi_3_wheels",  # 2. competition input
-    ]
-    _wh = next((p for p in _cand if p.is_dir()), None)
-    # Fallback: individual .whl files at SRC root (dirs skipped in dataset push)
-    if _wh is None and list(SRC.glob("*.whl")):
-        _wh = SRC  # use SRC as find-links (has individual .whl files)
-        print(f"[ARC] wheels: {{SRC}} (individual files)")
-    if _wh is not None:
-        print(f"[ARC] wheels: {{_wh}}")
+    # Try competition input first
+    _comp = Path("/kaggle/input/arc-agi-3") / "arc_agi_3_wheels"
+    if _comp.is_dir():
+        print(f"[ARC] wheels: {{_comp}}")
         r = subprocess.run(
             [sys.executable, "-m", "pip", "install", "-q",
-             "--no-index", f"--find-links={{_wh}}", "arc-agi", "arcengine", "python-dotenv"],
+             "--no-index", f"--find-links={{_comp}}",
+             "arc-agi", "arcengine", "python-dotenv"],
             capture_output=True, text=True, timeout=30
         )
         if r.returncode == 0:
-            import arc_agi; print("arc-agi installed"); return
-        print(f"[ARC] wheel err: {{r.stderr[:200]}}")
+            import arc_agi; print("arc-agi installed (competition)"); return
+        print(f"[ARC] comp wheel err: {{r.stderr[:100]}}")
+    # Try dataset wheels
+    _whls = sorted(SRC.glob("*.whl"))
+    if _whls:
+        for _w in _whls:
+            r = subprocess.run(
+                [sys.executable, "-m", "pip", "install", "-q", "--no-deps", str(_w)],
+                capture_output=True, text=True, timeout=60
+            )
+            if r.returncode != 0:
+                print(f"[ARC] {{_w.name}} err: {{r.stderr[:100]}}")
+        try:
+            import arc_agi; print("arc-agi installed (offline)"); return
+        except ImportError:
+            print("[ARC] install OK but import fails")
+    # PyPI fallback
     print("[ARC] no wheels - PyPI timeout=5s")
     try:
         r = subprocess.run(
@@ -210,24 +253,28 @@ CELL_4 = textwrap.dedent('''\
 # ═══════════════════════════════════════════════════════════════
 os.environ.setdefault("OPERATION_MODE", "offline")
 os.environ.setdefault("ENVIRONMENTS_DIR", str(SRC / "environment_files"))
-from arc_agi import Arcade
+from arc_agi import Arcade, EnvironmentInfo
 from arcengine import GameState as _GS, enums as _GE
 from wasm_bridge import functional_ttt_train, _extract_head_params, _extract_buffers, pure_batch_ttt_loss
 from step_adapter import safe_step
-import graph_explorer as _ge
-import dense_explorer as _de
-from frame_processor import FrameProcessor
 
-arc       = Arcade()
-env_infos = list(arc.available_environments)
-print(f"Games: {len(env_infos)}")
+# Discover games — try competition input first, then dataset environment_files
+_COMP_ENV = Path("/kaggle/input/arc-agi-3/environment_files")
+_DATASET_ENV = Path(os.environ.get("ENVIRONMENTS_DIR", str(SRC / "environment_files")))
+_ENV_DIR = _COMP_ENV if _COMP_ENV.is_dir() else _DATASET_ENV
+os.environ.setdefault("ENVIRONMENTS_DIR", str(_ENV_DIR))
+env_infos = []
+for _mf in sorted(_ENV_DIR.rglob("metadata.json")):
+    _jd = json.loads(_mf.read_text(encoding="utf-8"))
+    _jd["local_dir"] = str(_mf.parent)
+    env_infos.append(EnvironmentInfo.model_validate(_jd))
+print(f"Games: {len(env_infos)} [dir: {{_ENV_DIR.name if _ENV_DIR == _COMP_ENV else 'dataset'}}]")
 
-MAX_STEPS = 200
+# Arcade for game loading (make/g)
+arc = Arcade()
+
+MAX_STEPS = 2000
 TTT_STEPS = 30; TTT_LR = 8e-5; TTT_LAMBDA = 0.1
-trajectories, game_scores = {}, {}
-bfs_results = {}  # gid → (solved, n_actions, budget_used)
-_best_score = 0.0
-t0 = time.time()
 
 def extract_grid(frame):
     if isinstance(frame, np.ndarray) and frame.ndim == 2: return frame.astype(np.int32)
@@ -237,145 +284,57 @@ def extract_grid(frame):
     except: pass
     return None
 
-# Pre-allocate FrameProcessor for counter mask detection
-_fp_counter = FrameProcessor()
+def _frame_win(nf):
+    s = getattr(nf, "state", None) if nf is not None else None
+    return s is not None and ("WIN" in str(s) or (hasattr(s, 'value') and str(s.value) == "WIN"))
+
+game_scores, bfs_results, trajectories = {}, {}, {}
+_best_score = 0.0
+t0 = time.time()
 
 for idx, env_info in enumerate(env_infos):
     gid = str(getattr(env_info, "game_id", getattr(env_info, "id", idx)))
-    env = None; sbuf, abuf, rbuf = [], [], []; score = 0.0
+    env = None; sbuf, abuf, rbuf = [], [], []; score = 0.0; _frames = [None]; nf = None
     try:
         env = arc.make(gid)
         agent.set_game_tags(getattr(getattr(env, "info", None), "tags", []))
-        agent.set_step_modulus(3)  # enable step-modulus hashing
-        frame = env.reset()
-        if frame is None: continue
-        agent.on_game_start()
-
-        # ── v23: Game Profiler + DenseExplorer + StrategyCache ──
-        import dense_explorer as _de
+        agent.set_step_modulus(3)
         _act_list = list(getattr(env, "action_space", []))
         if not _act_list:
             _act_list = [_GE.GameAction.ACTION1, _GE.GameAction.ACTION2,
                          _GE.GameAction.ACTION3, _GE.GameAction.ACTION4,
                          _GE.GameAction.ACTION5, _GE.GameAction.ACTION6,
                          _GE.GameAction.ACTION7]
-        env.reset()
+        _frames = [env.reset()]
+        if _frames[0] is None: continue
         agent.on_game_start()
-        
-        # Profile game
-        _prof = _gp.profile_game(env)
-        _strategy = _gp.choose_solver(_prof, cache=_strategy_cache)
-        _sig = _gp.compute_signature(_prof)
-        print(f"  [{idx+1}] {gid}: {_strategy['name']} (n={_prof.n_actions}, "
-              f"c={_prof.has_complex}, lc={_prof.live_click_found}, "
-              f"seg_fb={_strategy['use_segment_fallback']})")
-        
-        # Execute strategy
-        _solved = False
-        _solution = None
-        
-        if _strategy["name"] == "simple_brute":
-            # Phase 1: single action repeated max_steps times
-            for _a_idx in range(min(4, len(_act_list))):
-                env.reset()
-                agent.on_game_start()
-                _ga = _act_list[_a_idx]
-                for _k in range(_strategy["max_steps"]):
-                    _nf = safe_step(env, _ga)
-                    if _nf is None: break
-                    if getattr(_nf, "state", None) is _GS.WIN:
-                        _solved = True; _solution = [_a_idx] * (_k + 1)
-                        print(f"  [{idx+1}] {gid}: simple*{_k+1} -> WIN")
-                        break
-                if _solved: break
-            # Phase 2: action pairs A→B
-            if not _solved:
-                for _ai in range(len(_act_list)):
-                    for _aj in range(len(_act_list)):
-                        if _ai == _aj: continue
-                        env.reset()
-                        agent.on_game_start()
-                        if safe_step(env, _act_list[_ai]) is None: continue
-                        _nf = safe_step(env, _act_list[_aj])
-                        if _nf is not None and getattr(_nf, "state", None) is _GS.WIN:
-                            _solved = True; _solution = [_ai, _aj]
-                            print(f"  [{idx+1}] {gid}: simple pair [{_ai},{_aj}] -> WIN")
-                            break
-                    if _solved: break
-        
-        elif _strategy["name"] == "graph_explore":
-            # Live click known → segment-based GraphExplorer (fast)
-            _fp = FrameProcessor()
-            _hfn = agent.get_hasher()
-            _rbae = getattr(agent, '_rhae', None)
-            _tt_lk = (lambda lo, hi: _rbae._exp["rhae_tt_lookup"](_rbae._store, lo, hi)
-                      if _rbae and _rbae._wasm_ok else lambda lo, hi: -1)
-            _tt_st = (lambda lo, hi, a, s: _rbae._exp["rhae_tt_store"](_rbae._store, lo, hi, a, s)
-                      if _rbae and _rbae._wasm_ok else lambda lo, hi, a, s: None)
-            _explorer = _ge.GraphExplorer(env, _fp, _hfn, _act_list, _tt_lk, _tt_st, live_click_xy=_prof.live_click_xy)
-            _solved = _explorer.explore(max_steps=_strategy["max_steps"])
-            if _solved and _explorer.solution:
-                _solution = [int(a) for a in _explorer.solution]
-                print(f"  [{idx+1}] {gid}: GraphExplorer solved in {len(_solution)}")
-        
-        elif _strategy["name"] == "dense_explore":
-            _exp = _de.DenseExplorer(env, _act_list)
-            _solved = _exp.explore(max_steps=_strategy["max_steps"])
-            if _solved and _exp.solution:
-                _solution = [int(a) for a in _exp.solution]
-                print(f"  [{idx+1}] {gid}: DenseExplorer solved in {len(_solution)} "
-                      f"(live_clicks={len(_exp.live_clicks)})")
-            elif _exp.live_clicks and not _solved:
-                # Dense found live clicks → retry with GraphExplorer
-                _fp = FrameProcessor()
-                _hfn = agent.get_hasher()
-                _ge_explorer = _ge.GraphExplorer(env, _fp, _hfn, _act_list, None, None)
-                _solved2 = _ge_explorer.explore(max_steps=500)
-                if _solved2 and _ge_explorer.solution:
-                    _solved = True
-                    _solution = [int(a) for a in _ge_explorer.solution]
-                    print(f"  [{idx+1}] {gid}: Dense→GraphExplorer solved in {len(_solution)}")
-        
-        elif _strategy["name"] == "fallback":
-            print(f"  [{idx+1}] {gid}: no strategy matched, skip to agent loop")
-        
-        if _solved and _solution:
-            _hba = getattr(env_info, "human_baseline_actions", len(_solution))
-            _aa = len(_solution)
-            score = min(1.15, (_hba / max(1, _aa)) ** 2)
-            game_scores[gid] = score
-            bfs_results[gid] = {"solved": True, "n_actions": len(_solution), "solver": _strategy['name']}
-            _best_score = max(_best_score, score)
-            _strategy_cache.store(_sig, _strategy["name"], True, len(_solution))
-            continue  # solved, skip agent loop
-        
-        # Fallback: agent loop (unchanged)
-
-            # Standard agent loop (paper)
-            env.reset()
-            agent.on_game_start()
-            for _ in range(MAX_STEPS):
-                act = agent.choose_action([frame], None)
-                _act_data = getattr(agent, '_last_action_data', None)
-                if wm is not None:
-                    grid = extract_grid(frame)
-                    if grid is not None:
-                        _aid = int(act.value[0]) if hasattr(act, 'value') and isinstance(act.value, tuple) else int(act)
-                        tok = wm.encode_state(grid, _aid)
-                        sbuf.append(tok.squeeze(0).cpu().numpy().astype(np.int32))
-                        abuf.append(_aid); rbuf.append(0.0)
-                if _act_data:
-                    nf = safe_step(env, act, x=_act_data.get("x"), y=_act_data.get("y"))
-                else:
-                    nf = safe_step(env, act)
-                if nf is None: break
-                r_ = float(getattr(nf, "levels_completed", 0) - getattr(frame, "levels_completed", 0))
-                score += r_
-                if rbuf: rbuf[-1] = r_
-                frame = nf
-                if getattr(frame, "state", None) in (_GS.WIN, _GS.GAME_OVER): break
-            game_scores[gid] = score
-            bfs_results[gid] = {"solved": False, "n_actions": 0, "budget_used": 2000}
+        for _ in range(MAX_STEPS):
+            act = agent.choose_action(_frames, None)
+            _act_data = getattr(agent, '_last_action_data', None)
+            _pframe = _frames[-1]
+            if wm is not None:
+                grid = extract_grid(_pframe)
+                if grid is not None:
+                    _aid = int(act.value[0]) if hasattr(act, 'value') and isinstance(act.value, tuple) else int(act)
+                    tok = wm.encode_state(grid, _aid)
+                    sbuf.append(tok.squeeze(0).cpu().numpy().astype(np.int32))
+                    abuf.append(_aid); rbuf.append(0.0)
+            if _act_data:
+                nf = safe_step(env, act, x=_act_data.get("x"), y=_act_data.get("y"))
+            else:
+                nf = safe_step(env, act)
+            if nf is None: break
+            r_ = float(getattr(nf, "levels_completed", 0) - getattr(_pframe, "levels_completed", 0))
+            score += r_
+            if rbuf: rbuf[-1] = r_
+            _frames.append(nf)
+            if getattr(nf, "state", None) is _GS.GAME_OVER: break
+            if _frame_win(nf): break
+        if sbuf: trajectories[gid] = {"states": np.stack(sbuf), "actions": np.array(abuf), "rewards": np.array(rbuf)}
+        game_scores[gid] = score
+        _nf_state = getattr(nf, "state", None)
+        bfs_results[gid] = {"solved": _nf_state is not None and "WIN" in str(_nf_state), "n_actions": 0, "budget_used": max(0, len(_frames) - 1) if _frames else 0}
+        print(f"  [{idx+1}] {gid}: score={score:.4f}, steps={max(0, len(_frames) - 1) if _frames else 0}")
 
         # ── Per-game TTT (GPU only) ──
         if len(sbuf) >= 4 and wm is not None and hasattr(wm, "to_fp16"):
@@ -407,8 +366,9 @@ for idx, env_info in enumerate(env_infos):
             try: env.close()
             except: pass
         gc.collect()
+    print(f"  [{idx+1}] {gid}: final score={score:.4f}, steps={max(0, len(_frames) - 1)}")
 
-n_traj = len(trajectories)
+n_traj = len(game_scores)  # removed trajectories ref
 mean_s = sum(game_scores.values()) / max(1, len(game_scores))
 n_solved = sum(1 for v in bfs_results.values() if v.get("solved"))
 print(f"Phase A: {n_traj}/{len(env_infos)} traj, solved {n_solved}/{len(env_infos)}, mean_score={mean_s:.4f}, t={time.time()-t0:.0f}s")

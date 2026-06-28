@@ -2084,7 +2084,7 @@ class VERICODINGAgent:
             return self._to_game_action(_win_action, frames, frame)
 
         # ── Zmiana 2: FrameGraphExplorer with WASM topk pre-filter ──
-        if cur_grid is not None and _state_hash and _prune_mask:
+        if cur_grid is not None and _state_hash and _prune_mask and _rhae._wasm_ok:
             # Fill vis_buf with per-action visited status (critical for build_candidates scoring)
             _vis = self._graph.fill_vis_buf(_rhae_lo, _rhae_hi)
             for _vi in range(min(len(_vis), self._n_actions)):
