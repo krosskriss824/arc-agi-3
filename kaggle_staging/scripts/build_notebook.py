@@ -84,6 +84,26 @@ for p in [str(WK), str(WK/"external"), str(WK/"external"/"urm")]:
 os.chdir(WK)
 print("Setup OK")
 
+# ── Patch submission_agent.py: guard _rhae._exp access when WASM unavailable ──
+_agent_py = (WK / "submission_agent.py").read_text(encoding="utf-8")
+_old_len = len(_agent_py)
+_agent_py = _agent_py.replace(
+    'if cur_grid is not None and _state_hash and _prune_mask:',
+    'if cur_grid is not None and _state_hash and _prune_mask and _rhae._wasm_ok:'
+)
+(WK / "submission_agent.py").write_text(_agent_py, encoding="utf-8")
+print("[patch] submission_agent.py: wasm_ok=" + ("YES" if len(_agent_py) != _old_len else "NO_CHANGE"))
+# ── Patch wasm_bridge.py: _exp never None (defaultdict noop) ──
+_wb = (WK / "wasm_bridge.py").read_text(encoding="utf-8")
+print("[patch] wasm_bridge.py: has_exp_None=" + str("self._exp = None" in _wb))
+print("[patch] wasm_bridge.py: has_exp_curly=" + str("self._exp =" in _wb and "None" not in _wb and "defaultdict" not in _wb))
+_wb = _wb.replace("self._exp = None",
+    "from collections import defaultdict; self._exp = defaultdict(lambda: lambda *a, **kw: None)")
+_wb = _wb.replace("self._exp = {{}}",
+    "from collections import defaultdict; self._exp = defaultdict(lambda: lambda *a, **kw: None)")
+(WK / "wasm_bridge.py").write_text(_wb, encoding="utf-8")
+print("[patch] wasm_bridge.py: defaultdict=" + ("YES" if "defaultdict" in _wb else "NO"))
+
 # Discover environment files (Kaggle auto-extracts .zip in datasets)
 _env_candidates = [
     SRC / "environment_files",                     # Kaggle auto-extracted
@@ -516,7 +536,7 @@ km = {
     "language": "python",
     "kernel_type": "notebook",
     "is_private": True,
-    "enable_gpu": False,
+    "enable_gpu": True,
     "enable_tpu": False,
     "enable_internet": False,
     "dataset_sources": [DATASET_SLUG],
