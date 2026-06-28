@@ -1,6 +1,14 @@
-# VERICODING - ARC-AGI-3 Solver
-.git/
 __pycache__/
-*.pyc
+*.py[cod]
+*.pyo
+*.so
+*.pt
+*.pth
+*.egg-info/
+.env
 .DS_Store
-*.zip
+/kaggle/
+*.bak_*
+*.wasm
+/data/
+/tmp/
