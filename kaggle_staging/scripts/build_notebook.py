@@ -329,6 +329,9 @@ for idx, env_info in enumerate(env_infos):
         else:
             _hint_xy = None
         
+        # Reset env after DenseExplorer pre-scan (env may be desynced)
+        _frames = [env.reset()]
+        
         for _ in range(MAX_STEPS):
             act = agent.choose_action(_frames, None)
             _act_data = getattr(agent, '_last_action_data', None)
