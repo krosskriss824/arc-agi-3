@@ -336,7 +336,7 @@ for idx, env_info in enumerate(env_infos):
             if wm is not None:
                 grid = extract_grid(_pframe)
                 if grid is not None:
-                    _aid = int(act.value[0]) if hasattr(act, 'value') and isinstance(act.value, tuple) else int(act)
+                    _aid = act.value[0] if isinstance(getattr(act, 'value', None), tuple) else getattr(act, 'value', 0)
                     tok = wm.encode_state(grid, _aid)
                     sbuf.append(tok.squeeze(0).cpu().numpy().astype(np.int32))
                     abuf.append(_aid); rbuf.append(0.0)
