@@ -161,10 +161,12 @@ def _carry_to_device(carry: Any, device: torch.device) -> Any:
     import dataclasses
     if not hasattr(carry, "current_hidden"):
         return carry
+    if not hasattr(carry, "steps"):
+        return carry
     return dataclasses.replace(
         carry,
         current_hidden=carry.current_hidden.to(device),
-        steps=carry.steps.to(device) if hasattr(carry, "steps") else carry.steps,
+        steps=carry.steps.to(device),
         halted=carry.halted.to(device) if hasattr(carry, "halted") else carry.halted,
         current_data={
             k: v.to(device) if isinstance(v, torch.Tensor) else v
