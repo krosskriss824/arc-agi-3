@@ -116,16 +116,21 @@ def install_arc_agi():
     try:
         import arc_agi; print("arc-agi OK"); return
     except ImportError: pass
+    # Candidate wheel directories
     _cand = [
-        SRC / "arc_wheels",               # 1. dataset offline wheels (v16.12+)
-        Path("{COMP_PATH}") / "arc_agi_3_wheels",
+        SRC / "arc_wheels",               # 1. dataset offline wheels dir
+        Path("{COMP_PATH}") / "arc_agi_3_wheels",  # 2. competition input
     ]
     _wh = next((p for p in _cand if p.is_dir()), None)
+    # Fallback: individual .whl files at SRC root (dirs skipped in dataset push)
+    if _wh is None and list(SRC.glob("*.whl")):
+        _wh = SRC  # use SRC as find-links (has individual .whl files)
+        print(f"[ARC] wheels: {{SRC}} (individual files)")
     if _wh is not None:
         print(f"[ARC] wheels: {{_wh}}")
         r = subprocess.run(
             [sys.executable, "-m", "pip", "install", "-q",
-             "--no-index", f"--find-links={{_wh}}", "arc-agi", "python-dotenv"],
+             "--no-index", f"--find-links={{_wh}}", "arc-agi", "arcengine", "python-dotenv"],
             capture_output=True, text=True, timeout=30
         )
         if r.returncode == 0:
