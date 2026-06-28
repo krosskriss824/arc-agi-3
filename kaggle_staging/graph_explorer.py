@@ -51,7 +51,7 @@ class GraphExplorer:
     W_WASM    = 1.0   # WASM build_candidates score (0-100)
 
     def __init__(self, env, fp, hasher, action_list, tt_lookup=None, tt_store=None,
-                 wasm_scorer=None, weights=None):
+                 wasm_scorer=None, weights=None, live_click_xy=None):
         self._env = env
         self._fp = fp
         self._hasher = hasher
@@ -61,6 +61,7 @@ class GraphExplorer:
         self._tt_lk = tt_lookup
         self._tt_st = tt_store
         self._wasm_scorer = wasm_scorer
+        self._live_xy = live_click_xy  # (x, y) from profiler, or None
         # Instance weights (overridable for adaptive search)
         self._weights = weights or {"W_TIER": 10.0, "W_AREA": 5.0, "W_NOVELTY": 3.0}  # fn(cx, cy) → score or None
 
@@ -180,6 +181,11 @@ class GraphExplorer:
                     all_cands.append((cx, cy, sid, area))
                     group_of.append(gid)
                     max_area = max(max_area, area)
+            # Inject profiler live_click_xy as highest-priority candidate
+            if self._live_xy is not None:
+                lx, ly = self._live_xy
+                all_cands.insert(0, (lx, ly, -2, max_area))
+                group_of.insert(0, 0)
             # Sort by heuristic score descending
             scored = [(self._score_candidate(group_of[i], cx, cy, area, max_area), i)
                       for i, (cx, cy, _, area) in enumerate(all_cands)]

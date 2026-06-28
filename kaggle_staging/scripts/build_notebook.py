@@ -270,6 +270,7 @@ for idx, env_info in enumerate(env_infos):
         _solution = None
         
         if _strategy["name"] == "simple_brute":
+            # Phase 1: single action repeated max_steps times
             for _a_idx in range(min(4, len(_act_list))):
                 env.reset()
                 agent.on_game_start()
@@ -282,6 +283,20 @@ for idx, env_info in enumerate(env_infos):
                         print(f"  [{idx+1}] {gid}: simple*{_k+1} -> WIN")
                         break
                 if _solved: break
+            # Phase 2: action pairs A→B
+            if not _solved:
+                for _ai in range(len(_act_list)):
+                    for _aj in range(len(_act_list)):
+                        if _ai == _aj: continue
+                        env.reset()
+                        agent.on_game_start()
+                        if safe_step(env, _act_list[_ai]) is None: continue
+                        _nf = safe_step(env, _act_list[_aj])
+                        if _nf is not None and getattr(_nf, "state", None) is _GS.WIN:
+                            _solved = True; _solution = [_ai, _aj]
+                            print(f"  [{idx+1}] {gid}: simple pair [{_ai},{_aj}] -> WIN")
+                            break
+                    if _solved: break
         
         elif _strategy["name"] == "graph_explore":
             # Live click known → segment-based GraphExplorer (fast)
@@ -292,7 +307,7 @@ for idx, env_info in enumerate(env_infos):
                       if _rbae and _rbae._wasm_ok else lambda lo, hi: -1)
             _tt_st = (lambda lo, hi, a, s: _rbae._exp["rhae_tt_store"](_rbae._store, lo, hi, a, s)
                       if _rbae and _rbae._wasm_ok else lambda lo, hi, a, s: None)
-            _explorer = _ge.GraphExplorer(env, _fp, _hfn, _act_list, _tt_lk, _tt_st)
+            _explorer = _ge.GraphExplorer(env, _fp, _hfn, _act_list, _tt_lk, _tt_st, live_click_xy=_prof.live_click_xy)
             _solved = _explorer.explore(max_steps=_strategy["max_steps"])
             if _solved and _explorer.solution:
                 _solution = [int(a) for a in _explorer.solution]

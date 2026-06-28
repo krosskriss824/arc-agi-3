@@ -8,7 +8,7 @@ class GameProfile:
     __slots__ = ("n_actions", "has_complex", "grid_empty", "has_objects",
                  "n_components", "absorbing", "idempotent", "repeated_win",
                  "dead_actions", "state_changers", "click_actions",
-                 "frame_shape", "action_names", "live_click_found")
+                  "frame_shape", "action_names", "live_click_found", "live_click_xy")
     def __init__(self):
         self.n_actions = 0
         self.has_complex = False
@@ -24,6 +24,7 @@ class GameProfile:
         self.frame_shape = (64, 64)
         self.action_names = []
         self.live_click_found = False  # quick probe found state-changing click
+        self.live_click_xy = None      # (px, py) of the live click position
 
 # ── Grid predicates ──
 
@@ -107,6 +108,7 @@ def profile_game(env):
             _h = hash(_g.tobytes()) if _g is not None else -1
             if _h != _bh and _h != -1:
                 prof.live_click_found = True
+                prof.live_click_xy = (_px, _py)
                 break
 
     # ── Step 1: One-step hash per action ──
