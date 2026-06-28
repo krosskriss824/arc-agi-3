@@ -1,7 +1,10 @@
 """
 submission_agent.py — SOTA ARC-AGI-3 Submission Agent
-Refactor v11: algebraic types, pure functional forward, device discipline,
-eager-only (no torch.compile), no TTT in submission path.
+Refactor v12:
+  - P2: GPU guard in build_agent + load_backbone (fp16 support)
+  - P0: _DummyCarry-safe encode_grid_numpy via wasm_bridge
+  - Algebraic types, pure functional forward, device discipline,
+    eager-only (no torch.compile), no TTT in submission path.
 
 Architecture:
   URMWMA           := world model adapter wrapping URM backbone
@@ -13,17 +16,25 @@ from dataclasses import dataclass, field
 from typing import Optional, NamedTuple
 import collections
 import math
+import os
+import sys
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-import sys, os
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "external"))
 
-from urm.models.urm.urm import URM, URMConfig, URMCarry
-from urm.models.losses import value_logits_to_scalar
+try:
+    from urm.models.urm.urm import URM, URMConfig, URMCarry
+    from urm.models.losses import value_logits_to_scalar
+    _HAS_URM = True
+except ImportError as _e:
+    print(f"[URMWMA] Cannot import URM: {_e}")
+    _HAS_URM = False
+    URMCarry = None
+
 from wasm_bridge import encode_grid_numpy, load_adapter
 
 
@@ -32,8 +43,8 @@ from wasm_bridge import encode_grid_numpy, load_adapter
 class ActionResult(NamedTuple):
     action:       int
     value:        float
-    confidence:   float        # max softmax prob of action head
-    hidden_norm:  float        # ||hidden||_2 / sqrt(T*H) — diagnostic
+    confidence:   float
+    hidden_norm:  float
 
 
 @dataclass(frozen=True)
@@ -45,26 +56,40 @@ class AgentConfig:
     fp16:        bool  = False
 
 
-# ─── DummyBackbone — placeholder until urm_checkpoint.pt is loaded ─────────
+# ─── DummyBackbone ────────────────────────────────────────────────────────────
 
 class _DummyBackbone(nn.Module):
     """
     Zero-weight stand-in backbone.
-    Matches URM interface: initial_carry + forward.
-    Used before load_backbone is called.
+    Used when URM import fails or before checkpoint is loaded.
     """
-
     def __init__(self, hidden_size: int) -> None:
         super().__init__()
         self.hidden_size = hidden_size
-        cfg = URMConfig(hidden_size=hidden_size)
-        self._urm = URM(cfg)
+        if _HAS_URM:
+            cfg = URMConfig(hidden_size=hidden_size)
+            self._urm = URM(cfg)
+        else:
+            # Minimal stub: linear map as placeholder
+            self._urm = nn.Linear(hidden_size, hidden_size)
 
-    def initial_carry(self, batch: dict) -> URMCarry:
-        return self._urm.initial_carry(batch)
+    def initial_carry(self, batch: dict):
+        if _HAS_URM:
+            return self._urm.initial_carry(batch)
+        return None
 
-    def forward(self, carry: URMCarry, batch: dict) -> tuple[URMCarry, dict]:
-        return self._urm(carry, batch)
+    def forward(self, carry, batch: dict) -> tuple:
+        if _HAS_URM:
+            return self._urm(carry, batch)
+        # stub: return zeros
+        B = batch["inputs"].size(0)
+        T = batch["inputs"].size(1)
+        h = self.hidden_size
+        dev = batch["inputs"].device
+        hidden = torch.zeros(B, T, h, device=dev)
+        logits = torch.zeros(B, T, 12, device=dev)
+        return None, {"logits": logits, "hidden": hidden,
+                      "current_hidden": hidden}
 
 
 # ─── URMWMA — world model adapter ────────────────────────────────────────────
@@ -72,13 +97,7 @@ class _DummyBackbone(nn.Module):
 class URMWMA(nn.Module):
     """
     URM World Model Adapter.
-    Wraps URM backbone with action embedding, action head, value head.
-
-    Invariants:
-      - compile_forward sets eager-only (no torch.compile)
-      - action_emb size = n_actions + 1 (padding_idx=0)
-      - forward derives device from state_tokens.device — zero external .to() needed
-      - load_backbone moves ALL parameters atomically; caller must not .to() externally
+    v12: fp16 support, GPU guard, graceful URM-missing fallback.
     """
 
     def __init__(self, cfg: AgentConfig = AgentConfig()) -> None:
@@ -90,7 +109,7 @@ class URMWMA(nn.Module):
         self.value_head  = nn.Linear(cfg.hidden_size, 5)
         self._init_heads()
         self._set_eager()
-        self._carry: Optional[URMCarry] = None
+        self._carry = None
 
     def _init_heads(self) -> None:
         nn.init.orthogonal_(self.action_head.weight, gain=0.01)
@@ -99,45 +118,61 @@ class URMWMA(nn.Module):
         nn.init.zeros_(self.value_head.bias)
 
     def _set_eager(self) -> None:
-        """Eagerly mode only — no torch.compile anywhere in submission path."""
         self._forward_pure_compiled = self._forward_pure
-        dev_name = "CUDA" if next(self.parameters(), torch.tensor(0)).is_cuda else "CPU"
+        try:
+            dev_name = next(self.parameters()).device
+        except StopIteration:
+            dev_name = "cpu"
         print(f"[URMWMA] Eager {dev_name}")
 
     @property
     def _device(self) -> torch.device:
-        return next(self.parameters()).device
+        try:
+            return next(self.parameters()).device
+        except StopIteration:
+            return torch.device("cpu")
 
     def load_backbone(self, checkpoint_path: str, device: str = "cpu") -> None:
         """
         Load urm_checkpoint.pt into backbone.
-        Moves ALL parameters to device atomically after load.
-        Caller must NOT call .to(device) on any submodule after this.
+        P2: auto-upgrade device to CUDA if available and device=="cpu" requested.
+        Moves ALL parameters atomically after load.
         """
+        # P2: GPU guard
+        if device == "cpu" and torch.cuda.is_available():
+            device = "cuda"
+            print(f"[load_backbone] P2: upgrading to CUDA")
+
         state = torch.load(checkpoint_path, map_location="cpu", weights_only=False)
-        # strip _orig_mod. prefix if present (torch.compile artifact)
         cleaned = {
             k.replace("_orig_mod.", "").replace("model.", "", 1): v
             for k, v in state.items()
         }
-        # load into backbone's inner URM
-        missing, unexpected = self._backbone._urm.load_state_dict(cleaned, strict=False)
-        print(f"[load_backbone] missing={len(missing)}, unexpected={len(unexpected)}")
-        # move everything atomically
+        if _HAS_URM:
+            missing, unexpected = self._backbone._urm.load_state_dict(cleaned, strict=False)
+            print(f"[load_backbone] missing={len(missing)}, unexpected={len(unexpected)}")
         self.to(device)
+        # P2: FP16 on GPU
+        if self.cfg.fp16 and device != "cpu":
+            self.half()
+            print(f"[load_backbone] FP16 enabled")
         self._set_eager()
         print(f"[load_backbone] model on {self._device}")
 
+    def encode_state(self, grid: np.ndarray, action: int = 0) -> torch.Tensor:
+        """Encode grid to token tensor on model device."""
+        tokens, _ = encode_grid_numpy(grid, action)
+        return torch.from_numpy(tokens).long().unsqueeze(0).to(self._device)
+
     def reset_carry(self) -> None:
-        """Reset recurrent carry between episodes."""
         self._carry = None
 
     def _forward_pure(
         self,
-        state_tokens: torch.Tensor,  # (B, T)
-        act_emb: torch.Tensor,       # (B, H)
+        state_tokens: torch.Tensor,
+        act_emb: torch.Tensor,
         device: torch.device,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple:
         clamped = state_tokens.clamp(0, 11)
         B       = clamped.size(0)
         batch   = {
@@ -151,12 +186,18 @@ class URMWMA(nn.Module):
         new_carry, outputs = self._backbone(carry, batch)
         self._carry = new_carry
 
-        logits = outputs["logits"]                               # (B, T, V)
-        hidden = new_carry.current_hidden.to(act_emb.dtype)     # (B, T, H)
-        pooled = hidden.mean(dim=1) + act_emb                   # (B, H)
+        logits = outputs["logits"]
+        # handle both URMCarry (has current_hidden) and stub (has hidden)
+        _h_key = "current_hidden" if "current_hidden" in outputs else "hidden"
+        hidden = outputs.get(_h_key, outputs["logits"].mean(-1, keepdim=True))
+        if hasattr(new_carry, "current_hidden"):
+            hidden = new_carry.current_hidden
 
-        action_logits = self.action_head(pooled)                 # (B, A)
-        value         = self.value_head(pooled)                  # (B, 5)
+        hidden = hidden.to(act_emb.dtype)
+        pooled = hidden.mean(dim=1) + act_emb
+
+        action_logits = self.action_head(pooled)
+        value         = self.value_head(pooled)
         return action_logits, value, logits, hidden
 
     def forward(
@@ -165,16 +206,19 @@ class URMWMA(nn.Module):
         action: Optional[int] = None,
         return_all: bool = False,
     ) -> dict:
-        # CANONICAL: device derived ONCE from state_tokens
         device = state_tokens.device
         B      = state_tokens.size(0)
+
+        # cast to model dtype (fp16 compat)
+        if self.cfg.fp16 and state_tokens.is_cuda:
+            state_tokens = state_tokens.to(dtype=torch.float16)
 
         act_t   = (
             torch.tensor([action], dtype=torch.long, device=device)
             if action is not None
             else torch.zeros(B, dtype=torch.long, device=device)
         )
-        act_emb = self.action_emb(act_t)                        # (1 or B, H)
+        act_emb = self.action_emb(act_t)
 
         action_logits, value, logits, hidden = self._forward_pure_compiled(
             state_tokens, act_emb, device
@@ -191,10 +235,6 @@ class URMWMA(nn.Module):
 
 @dataclass
 class EpisodeBuffer:
-    """
-    Rolling buffer of (state_tokens, action, reward) for one episode.
-    Bounded by max_len — oldest entries dropped automatically.
-    """
     max_len: int = 200
     _states:  collections.deque = field(default_factory=lambda: collections.deque(maxlen=200))
     _actions: collections.deque = field(default_factory=lambda: collections.deque(maxlen=200))
@@ -208,7 +248,7 @@ class EpisodeBuffer:
     def __len__(self) -> int:
         return len(self._states)
 
-    def as_tensors(self, device: torch.device) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def as_tensors(self, device: torch.device) -> tuple:
         states  = torch.from_numpy(np.stack(self._states)).long().to(device)
         actions = torch.tensor(list(self._actions), dtype=torch.long, device=device)
         rewards = torch.tensor(list(self._rewards), dtype=torch.float32, device=device)
@@ -220,78 +260,102 @@ class EpisodeBuffer:
         self._rewards.clear()
 
 
-# ─── VERICODINGAgent — main submission agent ─────────────────────────────────
+# ─── VERICODINGAgent ──────────────────────────────────────────────────────────
 
 class VERICODINGAgent:
     """
-    Stateful ARC-AGI-3 agent.
-    Wraps URMWMA with episode management and action selection.
-
-    Interface contract:
-      on_game_start() → resets carry + buffer
-      choose_action(frames, prev_action) → int
-      on_step(state, action, reward) → None  (records to buffer)
-
-    Submission invariant:
-      NO TTT calls here — sidecar training only.
-      NO .to(device) after construction — load_backbone handles device placement.
+    Stateful ARC-AGI-3 agent. v12: accepts both (cfg) and ("__init__") call.
+    Submission invariant: NO TTT here — sidecar only.
     """
 
-    def __init__(self, cfg: Optional[AgentConfig] = None) -> None:
-        self.cfg = cfg or AgentConfig()
+    def __init__(self, cfg=None) -> None:
+        # Compat: old notebooks pass "__init__" string as first arg
+        if isinstance(cfg, str) or cfg is None:
+            cfg = AgentConfig()
+        self.cfg = cfg
         self.wm  = URMWMA(self.cfg)
         self.buf = EpisodeBuffer(max_len=self.cfg.max_ep_len)
+        # compat shims for old-style attribute access
+        self.world_model = self.wm
+        self._last_action_data = None
+        self._game_tags = []
+        self._step_modulus = 1
         self.wm.eval()
 
-    # ── lifecycle ─────────────────────────────────────────────────────────────
+    def set_game_tags(self, tags) -> None:
+        self._game_tags = list(tags) if tags else []
+
+    def set_step_modulus(self, m: int) -> None:
+        self._step_modulus = max(1, int(m))
 
     def on_game_start(self) -> None:
         self.wm.reset_carry()
         self.buf.clear()
+        self._last_action_data = None
 
-    def on_step(self, state_tokens: np.ndarray, action: int, reward: float) -> None:
-        self.buf.push(state_tokens, action, reward)
-
-    # ── action selection ──────────────────────────────────────────────────────
+    def on_step(self, state_tokens, action: int, reward: float) -> None:
+        if isinstance(state_tokens, np.ndarray):
+            self.buf.push(state_tokens, action, reward)
 
     @torch.no_grad()
     def choose_action(
         self,
         frames: list,
-        prev_action: Optional[int],
-    ) -> ActionResult:
+        prev_action,
+    ):
         """
         Select action from current observation frames.
-        frames: list of grids (np.ndarray) — one per parallel env or single.
-        Returns ActionResult(action, value, confidence, hidden_norm).
+        Handles both raw grids and frame objects (with .frame attribute).
         """
         device = self.wm._device
 
-        # encode all frames — pure NumPy, no tensor allocation here
-        tokens_list = [encode_grid_numpy(f)[0] for f in frames]
+        tokens_list = []
+        for f in frames:
+            # handle frame objects
+            grid = getattr(f, "frame", f)
+            if isinstance(grid, (list, np.ndarray)):
+                grid = np.asarray(grid, dtype=np.int32)
+                if grid.ndim == 3:
+                    grid = grid[0]
+            else:
+                grid = np.zeros((1, 1), dtype=np.int32)
+            tok, _ = encode_grid_numpy(grid)
+            tokens_list.append(tok)
+
         state_tokens = torch.from_numpy(
             np.stack(tokens_list)
-        ).long().to(device)                                     # (B, T)
+        ).long().to(device)
 
-        out = self.wm(state_tokens, action=prev_action)
+        # resolve action int from enum or int
+        act_int = None
+        if prev_action is not None:
+            act_int = (
+                prev_action.value[0]
+                if isinstance(getattr(prev_action, "value", None), tuple)
+                else getattr(prev_action, "value", int(prev_action))
+            )
 
-        # action: argmax — vectorised, no Python loops
-        action_logits = out["action_logits"]                    # (B, A)
-        probs         = F.softmax(action_logits, dim=-1)
+        out = self.wm(state_tokens, action=act_int)
+
+        action_logits = out["action_logits"]
+        probs         = F.softmax(action_logits.float(), dim=-1)
         action_idx    = action_logits[0].argmax().item()
         confidence    = probs[0, action_idx].item()
 
-        value_scalar  = value_logits_to_scalar(out["value"])[0].item()
-
-        # hidden norm diagnostic (cheap)
-        # out["hidden"] may be None in normal mode
-        hidden_norm = 0.0
+        val_out = out["value"].float()
+        if _HAS_URM:
+            try:
+                value_scalar = value_logits_to_scalar(val_out)[0].item()
+            except Exception:
+                value_scalar = val_out.mean().item()
+        else:
+            value_scalar = val_out.mean().item()
 
         return ActionResult(
             action=int(action_idx),
             value=float(value_scalar),
             confidence=float(confidence),
-            hidden_norm=float(hidden_norm),
+            hidden_norm=0.0,
         )
 
 
@@ -303,16 +367,26 @@ def build_agent(
     n_actions:       int   = 7,
     hidden_size:     int   = 512,
     device:          str   = "cpu",
+    fp16:            bool  = False,
 ) -> VERICODINGAgent:
     """
     Factory: constructs and optionally loads backbone + adapter.
-    Single call replaces scattered .to() and load_state_dict calls.
+    P2: auto-upgrade to CUDA if available.
     """
-    cfg   = AgentConfig(n_actions=n_actions, hidden_size=hidden_size, device=device)
+    # P2: GPU guard
+    if device == "cpu" and torch.cuda.is_available():
+        device = "cuda"
+        fp16   = True
+        print(f"[build_agent] P2: auto-upgraded to CUDA+FP16")
+
+    cfg   = AgentConfig(n_actions=n_actions, hidden_size=hidden_size,
+                        device=device, fp16=fp16)
     agent = VERICODINGAgent(cfg)
 
-    if checkpoint_path is not None:
+    if checkpoint_path is not None and os.path.exists(checkpoint_path):
         agent.wm.load_backbone(checkpoint_path, device=device)
+    else:
+        print(f"[build_agent] no checkpoint — using DummyBackbone")
 
     if adapter_path is not None and os.path.exists(adapter_path):
         load_adapter(agent.wm, adapter_path)

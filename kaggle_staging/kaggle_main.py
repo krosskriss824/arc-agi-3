@@ -1,13 +1,10 @@
 """
 kaggle_main.py — ARC-AGI-3 Submission Orchestrator
-SOTA refactor v11: clean submission path, no TTT, device setup once,
-conditional wheel install, no render_mode warnings, no cache flushes in loop.
-
-Invariants:
-  - DEVICE set once at startup, never changed
-  - agent constructed ONCE via build_agent factory
-  - torch.cuda.empty_cache() called ONCE at end, not per-env
-  - TTT not imported here
+SOTA refactor v12:
+  - P1: max_steps 200→2000, early-stop at step>500 with score==0
+  - P2: GPU guard — prefer CUDA, FP16 on T4
+  - clean submission path, device setup once
+  - TTT sidecar via wasm_bridge (not in this file)
 """
 from __future__ import annotations
 import sys
@@ -34,10 +31,14 @@ sys.path.insert(0, str(REPO_ROOT / "external"))
 
 @dataclass(frozen=True)
 class RunConfig:
+    # P2: GPU guard — auto-detect CUDA
     device:          str  = "cuda" if torch.cuda.is_available() else "cpu"
+    fp16:            bool = torch.cuda.is_available()   # FP16 on GPU only
     n_actions:       int  = 7
     hidden_size:     int  = 512
-    max_steps:       int  = 200
+    # P1: raised from 200 to 2000; early-stop guards against infinite loops
+    max_steps:       int  = 2000
+    early_stop_step: int  = 500   # abort if score==0 after this many steps
     checkpoint_name: str  = "urm_checkpoint.pt"
     adapter_name:    str  = "adapter_global.pt"
     submission_file: str  = "submission.json"
@@ -47,6 +48,8 @@ CFG = RunConfig()
 
 CHECKPOINT_PATH = REPO_ROOT / "kaggle_staging" / CFG.checkpoint_name
 ADAPTER_PATH    = KAGGLE_WORKING / CFG.adapter_name
+
+print(f"[config] device={CFG.device} fp16={CFG.fp16} max_steps={CFG.max_steps}")
 
 
 # ─── arc-agi install — conditional, wheels preferred ─────────────────────────
@@ -77,15 +80,16 @@ def run_submission() -> None:
     import arc_agi as arc
     from submission_agent import build_agent
 
-    print(f"[run] device={CFG.device}")
+    print(f"[run] device={CFG.device} fp16={CFG.fp16}")
 
-    # Build agent ONCE — load_backbone moves all params atomically
+    # P2: build agent with GPU + optional FP16
     agent = build_agent(
         checkpoint_path=str(CHECKPOINT_PATH) if CHECKPOINT_PATH.exists() else None,
         adapter_path=str(ADAPTER_PATH) if ADAPTER_PATH.exists() else None,
         n_actions=CFG.n_actions,
         hidden_size=CFG.hidden_size,
         device=CFG.device,
+        fp16=CFG.fp16,
     )
 
     game_ids = arc.list_games()
@@ -94,12 +98,11 @@ def run_submission() -> None:
     results: dict[str, float] = {}
 
     for gid in game_ids:
-        env   = arc.make(gid)          # no render_mode="none" — avoids warning
+        env   = arc.make(gid)
         score = _run_episode(agent, env, gid)
         results[gid] = score
         env.close()
 
-    # single cache flush at end
     gc.collect()
     if CFG.device == "cuda":
         torch.cuda.empty_cache()
@@ -109,15 +112,15 @@ def run_submission() -> None:
 
 def _run_episode(agent, env, gid: str) -> float:
     """
-    Run one episode. Returns cumulative reward.
-    No torch ops here — pure Python control flow calling agent interface.
+    Run one episode.
+    P1: early-stop — if score==0 after early_stop_step steps, abort.
     """
     agent.on_game_start()
     obs, _info = env.reset()
     score       = 0.0
     prev_action: Optional[int] = None
 
-    for _ in range(CFG.max_steps):
+    for step in range(CFG.max_steps):
         result = agent.choose_action([obs], prev_action)
         obs, reward, done, truncated, _info = env.step(result.action)
         agent.on_step(obs, result.action, float(reward))
@@ -125,8 +128,11 @@ def _run_episode(agent, env, gid: str) -> float:
         prev_action = result.action
         if done or truncated:
             break
+        # P1: early-stop — don't waste budget on unwinnable games
+        if step >= CFG.early_stop_step and score == 0.0:
+            break
 
-    print(f"  [{gid}] score={score:.4f} conf={0.0:.4f}")
+    print(f"  [{gid}] score={score:.4f} steps={step+1}")
     return score
 
 
@@ -134,7 +140,9 @@ def _write_submission(results: dict[str, float]) -> None:
     out_path = KAGGLE_WORKING / CFG.submission_file
     out_path.parent.mkdir(parents=True, exist_ok=True)
     out_path.write_text(json.dumps(results, indent=2))
-    print(f"[submission] written to {out_path} ({len(results)} games)")
+    mean_s = sum(results.values()) / len(results) if results else 0.0
+    solved  = sum(1 for v in results.values() if v > 0)
+    print(f"[submission] {solved}/{len(results)} solved, mean={mean_s:.4f} → {out_path}")
 
 
 # ─── Entry point ─────────────────────────────────────────────────────────────
