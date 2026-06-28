@@ -276,6 +276,7 @@ class GraphExplorer:
                 grid = self._get_grid(frame)
                 sh = self._grid_hash(grid)
                 self._frontier.add(sh)
+                self._get_or_create_node(sh, frame)
                 _found = 0
                 # Run _trial_budget steps with this config
                 _trial_steps = 0
@@ -305,6 +306,7 @@ class GraphExplorer:
                     self._edges[(cur_h, sk)] = (nh, nf)
                     if nh != cur_h and nh not in self._nodes:
                         self._frontier.add(nh)
+                        self._get_or_create_node(nh, nf)
                         _found += 1
                 self._budget = _prev_budget
                 if _found > _best_count:
@@ -329,6 +331,7 @@ class GraphExplorer:
         grid = self._get_grid(frame)
         start_hash = self._grid_hash(grid)
         self._frontier.add(start_hash)
+        self._get_or_create_node(start_hash, frame)
 
         # ── Counter mask: detect volatile pixels (timer/score) ──
         _frame2 = self._safe_step(0, 32, 32)
@@ -387,6 +390,7 @@ class GraphExplorer:
 
                 if nhash != cur_hash and nhash not in self._nodes:
                     self._frontier.add(nhash)
+                    self._get_or_create_node(nhash, nf)
                     self._path.append((aidx, cx, cy))
                     self._prefix[nhash] = self._prefix.get(cur_hash, []) + [(aidx, cx, cy)]
 
