@@ -268,8 +268,7 @@ class GraphExplorer:
                 self._distances.clear()
                 self._global_tried.clear()
                 self._prefix.clear()
-                self._env.reset()
-                frame = self._safe_step(0)
+                frame = self._env.reset()  # TRUE initial state, no action executed
                 if frame is None:
                     self._weights = _best_weights
                     break
@@ -324,8 +323,7 @@ class GraphExplorer:
         self._distances.clear()
         self._global_tried.clear()
         self._prefix.clear()
-        self._env.reset()
-        frame = self._safe_step(0)
+        frame = self._env.reset()  # TRUE initial state, no action executed
         if frame is None:
             return False
         grid = self._get_grid(frame)

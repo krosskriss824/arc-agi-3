@@ -72,9 +72,8 @@ class DenseExplorer:
         """Try every click position. Return solution or list of live clicks."""
         live_clicks = []
 
-        # Baseline: state after reset + first step
-        self._env.reset()
-        _bf = self._safe_step(0)
+        # Baseline: true initial state (no action executed)
+        _bf = self._env.reset()
         _bg = _get_grid(_bf)
         baseline_hash = _grid_hash(_bg)
 
@@ -139,9 +138,10 @@ class DenseExplorer:
                 nh = _grid_hash(ng)
                 if nh not in explored:
                     explored.add(nh)
-                    frontier_nodes.append((nh, list(prefix) + [(aidx, -1, -1)]))
-            
-            # Also try click at each known live click position
+                    if self._actions[aidx].is_complex():
+                        frontier_nodes.append((nh, list(prefix) + [(aidx, 32, 32)]))
+                    else:
+                        frontier_nodes.append((nh, list(prefix) + [(aidx, -1, -1)]))
             if self._click_idx is not None:
                 for lcx, lcy, _ in live_clicks[:10]:
                     if self._total_steps >= self._budget:
