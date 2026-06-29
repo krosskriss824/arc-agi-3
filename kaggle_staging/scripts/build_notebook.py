@@ -85,18 +85,29 @@ if CHKPT.exists():
     if wm is not None:
         load_fn = getattr(wm, "load_backbone", getattr(wm, "loadbackbone", None))
         if load_fn:
-            load_fn(str(CHKPT), device="cpu")
+            # Force CPU: P100 (sm_60) has no CUDA kernels for URM
+            # Agent 2's load_backbone auto-upgrades to CUDA — bypass by patching torch.cuda.is_available
+            import torch as _t
+            _orig_cuda_avail = _t.cuda.is_available
+            _t.cuda.is_available = lambda: False
+            try:
+                load_fn(str(CHKPT), device="cpu")
+            finally:
+                _t.cuda.is_available = _orig_cuda_avail
             wm.eval()
             print("URM backbone loaded (CPU)")
         else:
             wm = None
-# Monkey-patch _carry_to_device for DummyCarry (dataset has old version)
-_sa_orig = sa._carry_to_device
-def _safe_carry(carry, device):
-    if not hasattr(carry, 'steps'): return carry
-    return _sa_orig(carry, device)
-sa._carry_to_device = _safe_carry
-print(f"[patch] _carry_to_device OK (orig={hasattr(_sa_orig,'__code__')})")
+# Monkey-patch _carry_to_device for DummyCarry (only if function exists)
+if hasattr(sa, '_carry_to_device'):
+    _sa_orig = sa._carry_to_device
+    def _safe_carry(carry, device):
+        if not hasattr(carry, 'steps'): return carry
+        return _sa_orig(carry, device)
+    sa._carry_to_device = _safe_carry
+    print(f"[patch] _carry_to_device OK (orig={hasattr(_sa_orig,'__code__')})")
+else:
+    print("[patch] _carry_to_device not in module (Agent 2 v11) - skipping")
 
 print(f"Agent: {type(agent).__name__}, WM: {type(wm).__name__ if wm else None}")
 """)
@@ -142,27 +153,39 @@ for idx, ei in enumerate(env_infos):
         if _frames[0] is None: continue
         agent.on_game_start()
 
-        # _rhae guard: never None
-        _rhae = __import__("submission_agent")._rhae
-        if _rhae._exp is None:
-            _rhae._exp = defaultdict(lambda: lambda *a,**kw: None)
+        # _rhae guard: never None (only if module has _rhae)
+        _sa_mod = __import__("submission_agent")
+        if hasattr(_sa_mod, "_rhae"):
+            _rhae = _sa_mod._rhae
+            if _rhae._exp is None:
+                _rhae._exp = defaultdict(lambda: lambda *a,**kw: None)
 
         for _ in range(MAX_STEPS):
             act = agent.choose_action(_frames, None)
-            ad = getattr(agent, "_last_action_data", None)
+            # Agent 2 returns ActionResult (NamedTuple with .action int)
+            # Convert to GameAction for env.step
+            if hasattr(act, 'action') and not hasattr(act, 'is_complex'):
+                _aidx = act.action
+                _ga = _GE.GameAction
+                _ga_list = list(_ga)
+                _game_act = _ga_list[_aidx % len(_ga_list)]
+                ad = None
+            else:
+                _game_act = act
+                ad = getattr(agent, "_last_action_data", None)
             pframe = _frames[-1]
             if wm is not None and pframe is not None:
                 grid = getattr(pframe,"frame",None)
                 if grid is not None and len(grid)>0:
                     g = np.asarray(grid[0], dtype=np.int32)
-                    aid = act.value[0] if isinstance(getattr(act,"value",None),tuple) else getattr(act,"value",0)
-                    tok = wm.encode_state(g, aid)
+                    _aid = _aidx if 'aidx' in dir() else 0
+                    tok = wm.encode_state(g, _aid)
                     sbuf.append(tok.squeeze(0).cpu().numpy().astype(np.int32))
-                    abuf.append(aid)
+                    abuf.append(_aid)
             if ad:
-                nf = safe_step(env, act, x=ad.get("x"), y=ad.get("y"))
+                nf = safe_step(env, _game_act, x=ad.get("x"), y=ad.get("y"))
             else:
-                nf = safe_step(env, act)
+                nf = safe_step(env, _game_act)
             if nf is None: break
             score += float(getattr(nf,"levels_completed",0)-getattr(pframe,"levels_completed",0))
             _frames.append(nf)
@@ -175,7 +198,15 @@ for idx, ei in enumerate(env_infos):
         # Per-game TTT (CPU/GPU)
         if len(sbuf)>=4 and wm is not None:
             try:
-                tdev = "cuda" if torch.cuda.is_available() else "cpu"
+                # Detect P100 (sm_60) — use CPU for TTT when P100
+                tdev = "cpu"
+                if torch.cuda.is_available():
+                    try:
+                        cap = torch.cuda.get_device_capability(0)
+                        if cap[0] >= 7:
+                            tdev = "cuda"
+                    except:
+                        pass
                 s = torch.from_numpy(np.stack(sbuf)).long().to(tdev)
                 a = torch.from_numpy(np.array(abuf)).long().to(tdev)
                 ns = torch.cat([s[1:],s[-1:]],dim=0)
@@ -183,10 +214,10 @@ for idx, ei in enumerate(env_infos):
                 params = {k:v.to(tdev).requires_grad_(True) for k,v in _extract_head_params(wm).items()}
                 bufs = {k:v.to(tdev) for k,v in _extract_buffers(wm).items()}
                 new_p = functional_ttt_train(params, bufs, wm, s, a, ns, rw, steps=30, lr=8e-5, lambda_reg=0.1)
-                if score>0.0:
-                    for k,v in wm.named_parameters():
-                        if k in new_p: v.data.copy_(new_p[k].cpu())
-                    print(f"    [TTT] params applied (tdev={tdev})")
+                # P4: apply TTT always (cross-game transfer)
+                for k,v in wm.named_parameters():
+                    if k in new_p: v.data.copy_(new_p[k].cpu())
+                print(f"    [TTT] params applied (tdev={tdev}, score={score:.2f})")
                 if tdev == "cuda":
                     torch.cuda.empty_cache()
             except Exception as _tte:
