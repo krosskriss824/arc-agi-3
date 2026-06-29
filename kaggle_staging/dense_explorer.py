@@ -5,6 +5,8 @@ Architecture:
   Phase 2: Dense click scan (1024 positions, stride=2)
   Phase 3: Replay BFS from live clicks (reset-replay frontier)
   Phase 4: 1px refinement around unique live click states
+
+FIX v75.2: BFS expansion uses live_click coords (not hardcoded cx=32,cy=32)
 """
 import numpy as np
 from collections import deque
@@ -85,7 +87,7 @@ class DenseExplorer:
             if nf is None:
                 continue
             if _is_win(nf):
-                self.solution = [self._click_idx]
+                self.solution = [(self._click_idx, px, py)]
                 return "WIN", [(px, py, None)]
             grid = _get_grid(nf)
             h = _grid_hash(grid)
@@ -96,36 +98,36 @@ class DenseExplorer:
     # ── Phase 3: Replay BFS from live clicks (Occam-style) ──
     def _replay_bfs(self, live_clicks, max_steps):
         """Reset-replay BFS: env.reset() → replay prefix → try all actions.
-        
-        Live clicks form initial frontier nodes. Each node has a replay prefix
-        (list of action tuples). Separated replay budget (avoids spending
-        exploration steps on reconstruction).
+
+        FIX v75.2: when expanding click actions, uses live_click coords
+        from the discovered states instead of hardcoded (32,32).
         """
         if not live_clicks:
             return False
-        
+
         # Deduplicate live clicks by state hash
         seen = set()
-        frontier_nodes = []  # each: (state_hash, prefix: list[(aidx, cx, cy)])
+        # frontier nodes: (state_hash, prefix: list[(aidx, cx, cy)])
+        # Store live_click_xy per node for targeted expansion
+        frontier_nodes = []  # (hash, prefix, live_xy_list)
         for px, py, h in live_clicks:
             if h not in seen:
                 seen.add(h)
-                frontier_nodes.append((h, [(self._click_idx, px, py)]))
-        
+                frontier_nodes.append((h, [(self._click_idx, px, py)], [(px, py)]))
+
         explored = set(seen)
-        _replay_budget = max_steps  # steps allowed for replay
-        
+
         while frontier_nodes and self._total_steps < self._budget:
             # BFS: pop shortest prefix first
             frontier_nodes.sort(key=lambda n: len(n[1]))
-            cur_hash, prefix = frontier_nodes.pop(0)
-            
+            cur_hash, prefix, node_live_xy = frontier_nodes.pop(0)
+
             # Replay prefix to reach this state
             if not self._replay_prefix(prefix):
                 continue
-            
-            # Try all actions from this state
-            for aidx in range(len(self._actions)):
+
+            # Try all simple actions
+            for aidx in self._simple_indices:
                 if self._total_steps >= self._budget:
                     return self.solution is not None
                 nf = self._safe_step(aidx)
@@ -138,28 +140,38 @@ class DenseExplorer:
                 nh = _grid_hash(ng)
                 if nh not in explored:
                     explored.add(nh)
-                    if self._actions[aidx].is_complex():
-                        frontier_nodes.append((nh, list(prefix) + [(aidx, 32, 32)]))
-                    else:
-                        frontier_nodes.append((nh, list(prefix) + [(aidx, -1, -1)]))
+                    frontier_nodes.append((nh, list(prefix) + [(aidx, 32, 32)], node_live_xy))
+
+            # Try click actions: use coords from live_clicks for this node
+            # FIX: use the actual coordinates discovered, not (32,32)
+            coords_to_try = node_live_xy[:10]  # top 10 from this node's context
+            # Also try global live_clicks for cross-pollination
+            for lcx, lcy, _ in live_clicks[:5]:
+                if (lcx, lcy) not in [(x, y) for x, y in coords_to_try]:
+                    coords_to_try.append((lcx, lcy))
+
             if self._click_idx is not None:
-                for lcx, lcy, _ in live_clicks[:10]:
+                for lcx, lcy in coords_to_try:
                     if self._total_steps >= self._budget:
                         break
                     nf = self._safe_step(self._click_idx, lcx, lcy)
                     if nf is None:
                         continue
                     if _is_win(nf):
-                        self.solution = [a for a, _, _ in prefix] + [self._click_idx]
+                        self.solution = [a for a, _, _ in prefix] + [(self._click_idx, lcx, lcy)]
                         return True
                     ng = _get_grid(nf)
                     nh = _grid_hash(ng)
                     if nh not in explored:
                         explored.add(nh)
-                        frontier_nodes.append((nh, list(prefix) + [(self._click_idx, lcx, lcy)]))
-        
+                        frontier_nodes.append((
+                            nh,
+                            list(prefix) + [(self._click_idx, lcx, lcy)],
+                            [(lcx, lcy)]  # pass coords forward
+                        ))
+
         return self.solution is not None
-    
+
     def _replay_prefix(self, prefix):
         """env.reset() → step through prefix actions. Returns True if all steps succeeded."""
         self._env.reset()
@@ -192,7 +204,7 @@ class DenseExplorer:
                     if nf is None:
                         continue
                     if _is_win(nf):
-                        self.solution = [self._click_idx]
+                        self.solution = [(self._click_idx, nx, ny)]
                         return True
         return False
 

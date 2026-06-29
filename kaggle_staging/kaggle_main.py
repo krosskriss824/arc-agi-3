@@ -1,20 +1,20 @@
 """
 kaggle_main.py — ARC-AGI-3 Submission Orchestrator
-v75.1 FIXES:
-  - DenseExplorer solution replay uses action_list[idx] objects (not ints)
-  - Complex actions go through safe_step(env, action_obj, cx, cy)
-  - _get_action_list() validates .is_complex() attribute
-  - Full traceback on non-fatal errors (dense + beam)
-  - Strategy counter in submission summary
-  - GPU diagnostics at startup
+v76.0 CHANGES:
+  - GraphExplorer inserted as Strategy 1a (3rd-place port, 17/25 levels)
+  - beam_search.py: full smart_solve() implementation (was 'placeholder')
+  - dense_budget 3000→6000, graph_budget=8000
+  - time_per_game 50→90s
+  - DenseExplorer BFS cx/cy fix (v75.2)
+  - _replay_dense_solution handles tuple solution items correctly
 
 Strategy order:
-  0. Cache replay (deterministic, free)
-  1. DenseExplorer (4-phase: simple brute → dense scan 1024 → BFS replay → 1px refine)
-  2. Beam search (w=4, d=20) + D4 hash pruning
-  3. TTT on winning trajectory
-  4. MCTS (inside beam, 150 sims)
-  5. TTT-calibrated agent rollout (final fallback)
+  0. Cache replay  (deterministic, free)
+  1a. GraphExplorer (heuristic ranker + counter mask + adaptive weights)
+  1b. DenseExplorer (4-phase: simple brute → dense scan → BFS replay → 1px)
+  2.  Beam search  (w=4, d=20) + MCTS fallback (150 sims)
+  3.  TTT on beam trajectory
+  4.  Agent rollout (final fallback)
 """
 from __future__ import annotations
 import sys
@@ -31,17 +31,17 @@ from collections import Counter
 import torch
 import numpy as np
 
-# ─── Paths ───────────────────────────────────────────────────────────────────────────────
+# ─── Paths ───────────────────────────────────────────────────────────────────
 
 KAGGLE_INPUT   = Path("/kaggle/input")
 KAGGLE_WORKING = Path("/kaggle/working")
-REPO_ROOT      = Path(__file__).resolve().parent   # = kaggle_staging/
+REPO_ROOT      = Path(__file__).resolve().parent
 
 sys.path.insert(0, str(REPO_ROOT))
 sys.path.insert(0, str(REPO_ROOT / "external"))
 sys.path.insert(0, str(REPO_ROOT / "external" / "urm"))
 
-# ─── Config ───────────────────────────────────────────────────────────────────────────────
+# ─── Config ───────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
 class RunConfig:
@@ -55,15 +55,19 @@ class RunConfig:
     adapter_name:    str  = "adapter_global.pt"
     submission_file: str  = "submission.json"
 
-    # Dense explorer (Strategy 1)
-    dense_budget:  int   = 3000
-    dense_enabled: bool  = True
+    # GraphExplorer (Strategy 1a) — primary explorer
+    graph_budget:   int   = 8000
+    graph_enabled:  bool  = True
 
-    # Beam search (Strategy 2)
+    # DenseExplorer (Strategy 1b) — fallback explorer
+    dense_budget:   int   = 6000
+    dense_enabled:  bool  = True
+
+    # Beam search + MCTS (Strategy 2)
     beam_width:    int   = 4
     beam_depth:    int   = 20
     mcts_sims:     int   = 150
-    time_per_game: float = 50.0
+    time_per_game: float = 90.0
 
     # TTT (Strategy 3)
     ttt_steps:    int   = 50
@@ -76,9 +80,10 @@ class RunConfig:
 CFG = RunConfig()
 
 print(f"[config] device={CFG.device} fp16={CFG.fp16}")
-print(f"[config] DenseExplorer={CFG.dense_enabled} dense_budget={CFG.dense_budget}")
-print(f"[config] beam_width={CFG.beam_width} beam_depth={CFG.beam_depth} mcts_sims={CFG.mcts_sims}")
-print(f"[config] ttt_enabled={CFG.ttt_enabled} ttt_steps={CFG.ttt_steps}")
+print(f"[config] GraphExplorer={CFG.graph_enabled} budget={CFG.graph_budget}")
+print(f"[config] DenseExplorer={CFG.dense_enabled} budget={CFG.dense_budget}")
+print(f"[config] beam_width={CFG.beam_width} depth={CFG.beam_depth} mcts={CFG.mcts_sims}")
+print(f"[config] ttt={CFG.ttt_enabled} steps={CFG.ttt_steps} time_per_game={CFG.time_per_game}s")
 
 if torch.cuda.is_available():
     _props = torch.cuda.get_device_properties(0)
@@ -87,7 +92,7 @@ else:
     print("[gpu] CPU only")
 
 
-# ─── arc-agi install ────────────────────────────────────────────────────────────────────
+# ─── arc-agi install ──────────────────────────────────────────────────────────
 
 def _install_arc_agi() -> None:
     wh = (
@@ -107,7 +112,7 @@ def _install_arc_agi() -> None:
     print(f"[install] arc-agi installed")
 
 
-# ─── Cache loader ───────────────────────────────────────────────────────────────────
+# ─── Cache loader ─────────────────────────────────────────────────────────────
 
 def _load_traj_cache():
     try:
@@ -119,7 +124,7 @@ def _load_traj_cache():
         return None
 
 
-# ─── Action list helper ─────────────────────────────────────────────────────────────────
+# ─── Action list helper ───────────────────────────────────────────────────────
 
 def _get_action_list(env):
     """Return list of action objects with .is_complex() method."""
@@ -131,20 +136,19 @@ def _get_action_list(env):
                 return acts
         except Exception:
             continue
-    print("[warn] could not get action list with .is_complex() — DenseExplorer will be skipped")
+    print("[warn] could not get action list with .is_complex() — explorers will be skipped")
     return []
 
 
-# ─── Dense solution replay ───────────────────────────────────────────────────────────────
+# ─── Dense/Graph solution replay ──────────────────────────────────────────────
 
-def _replay_dense_solution(env, solution, action_list):
-    """Replay DenseExplorer solution using proper action objects + safe_step.
+def _replay_explorer_solution(env, solution, action_list):
+    """Replay explorer solution (DenseExplorer or GraphExplorer).
 
-    explorer.solution is a list of:
-      - int  → action index into action_list, click at (32,32)
-      - (aidx, cx, cy) tuple  → BFS prefix item with explicit coords
+    solution items can be:
+      - int          → action index, click at (32,32)
+      - (aidx,cx,cy) → tuple with explicit coords
 
-    Uses safe_step() so complex actions always get data={x,y}.
     Returns (score, list_of_action_indices).
     """
     from step_adapter import safe_step
@@ -165,7 +169,6 @@ def _replay_dense_solution(env, solution, action_list):
         if result is None:
             break
 
-        # Extract reward + done from result (Frame object or tuple)
         reward = 0.0
         won    = False
         if hasattr(result, "reward"):
@@ -183,7 +186,17 @@ def _replay_dense_solution(env, solution, action_list):
     return score, replay_actions
 
 
-# ─── Submission runner ───────────────────────────────────────────────────────────────────
+# ─── hasher helper ────────────────────────────────────────────────────────────
+
+def _make_hasher():
+    try:
+        from wasm_bridge import canonical_hash
+        return canonical_hash
+    except Exception:
+        return lambda g: hash(g.tobytes())
+
+
+# ─── Submission runner ────────────────────────────────────────────────────────
 
 def run_submission() -> None:
     _install_arc_agi()
@@ -228,7 +241,7 @@ def run_submission() -> None:
 
 def _run_episode(agent, env, gid: str, traj_cache=None) -> Tuple[float, str]:
     """
-    v75.1 multi-strategy episode pipeline.
+    v76.0 multi-strategy episode pipeline.
     Returns (score, strategy_name).
     """
     t_start = time.time()
@@ -249,7 +262,41 @@ def _run_episode(agent, env, gid: str, traj_cache=None) -> Tuple[float, str]:
             print(f"  [{gid}] cache score={score:.4f}")
             return score, "cache"
 
-    # ── STRATEGY 1: DenseExplorer ─────────────────────────────────────────────
+    # ── STRATEGY 1a: GraphExplorer ────────────────────────────────────────────
+    if CFG.graph_enabled:
+        try:
+            from graph_explorer import GraphExplorer
+            from frame_processor import FrameProcessor
+            action_list = _get_action_list(env)
+            if action_list:
+                hasher = _make_hasher()
+                fp = FrameProcessor()
+                env.reset()
+                explorer = GraphExplorer(
+                    env=env,
+                    fp=fp,
+                    hasher=hasher,
+                    action_list=action_list,
+                )
+                found = explorer.explore(max_steps=CFG.graph_budget)
+                elapsed_graph = time.time() - t_start
+                if found and explorer.solution:
+                    score, sol_actions = _replay_explorer_solution(env, explorer.solution, action_list)
+                    print(f"  [{gid}] ★ GRAPH score={score:.4f} steps={explorer._total_steps} t={elapsed_graph:.1f}s")
+                    if score > 0 and traj_cache is not None and sol_actions:
+                        initial_obs, _ = env.reset()
+                        traj_cache.record(initial_obs, sol_actions)
+                    return score, "graph"
+                else:
+                    print(f"  [{gid}] graph no-win ({explorer._total_steps} steps, {elapsed_graph:.1f}s) → dense")
+            else:
+                print(f"  [{gid}] no action_list → skipping graph")
+        except Exception as e:
+            import traceback
+            print(f"  [{gid}] GraphExplorer error (non-fatal): {e}")
+            print(traceback.format_exc())
+
+    # ── STRATEGY 1b: DenseExplorer ─────────────────────────────────────────────
     if CFG.dense_enabled:
         try:
             from dense_explorer import DenseExplorer
@@ -260,7 +307,7 @@ def _run_episode(agent, env, gid: str, traj_cache=None) -> Tuple[float, str]:
                 found = explorer.explore(max_steps=CFG.dense_budget)
                 elapsed_dense = time.time() - t_start
                 if found and explorer.solution:
-                    score, sol_actions = _replay_dense_solution(env, explorer.solution, action_list)
+                    score, sol_actions = _replay_explorer_solution(env, explorer.solution, action_list)
                     print(f"  [{gid}] ★ DENSE score={score:.4f} steps={explorer._total_steps} t={elapsed_dense:.1f}s")
                     if score > 0 and traj_cache is not None and sol_actions:
                         initial_obs, _ = env.reset()
@@ -279,7 +326,7 @@ def _run_episode(agent, env, gid: str, traj_cache=None) -> Tuple[float, str]:
     elapsed     = time.time() - t_start
     beam_budget = max(5.0, CFG.time_per_game - elapsed)
 
-    # ── STRATEGY 2: Beam search ───────────────────────────────────────────────
+    # ── STRATEGY 2: Beam search + MCTS ───────────────────────────────────────
     beam_score   = 0.0
     beam_actions: list[int] = []
     try:
@@ -312,7 +359,7 @@ def _run_episode(agent, env, gid: str, traj_cache=None) -> Tuple[float, str]:
         print(f"  [{gid}] beam error (non-fatal): {e}")
         print(traceback.format_exc())
 
-    # ── STRATEGY 3: TTT on beam trajectory ─────────────────────────────────
+    # ── STRATEGY 3: TTT on beam trajectory ───────────────────────────────────
     if CFG.ttt_enabled and beam_actions:
         try:
             from ttt_submission import ttt_on_trajectory
@@ -337,7 +384,7 @@ def _run_episode(agent, env, gid: str, traj_cache=None) -> Tuple[float, str]:
             traj_cache.record(initial_obs, beam_actions)
         return beam_score, "beam"
 
-    # ── STRATEGY 4+5: TTT-calibrated agent rollout (final fallback) ─────────
+    # ── STRATEGY 4: TTT-calibrated agent rollout (final fallback) ────────────
     env.reset()
     agent.on_game_start()
     fallback_score    = 0.0
@@ -375,7 +422,7 @@ def _write_submission(results: dict[str, float], strategy_log: dict[str, str] = 
         print(f"[strategies] {dict(strats)}")
 
 
-# ─── Entry point ──────────────────────────────────────────────────────────────────────────
+# ─── Entry point ──────────────────────────────────────────────────────────────
 
 if __name__ == "__main__":
     run_submission()
