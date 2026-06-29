@@ -1,0 +1,16 @@
+# arc-agi-3-v11 dataset manifest
+# Files to include in Kaggle dataset upload
+# Generated: 2026-06-29
+
+kaggle_staging/kaggle_main.py
+kaggle_staging/submission_agent.py
+kaggle_staging/step_adapter.py
+kaggle_staging/frame_processor.py
+kaggle_staging/graph_explorer.py
+kaggle_staging/dense_explorer.py
+kaggle_staging/beam_search.py
+kaggle_staging/wasm_bridge.py
+kaggle_staging/trajectory_cache.py
+kaggle_staging/game_profiler.py
+kaggle_staging/algebra_probe.py
+kaggle_staging/ttt_submission.py
