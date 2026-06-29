@@ -7,6 +7,7 @@ Architecture:
   Phase 4: 1px refinement around unique live click states
 
 FIX v75.2: BFS expansion uses live_click coords (not hardcoded cx=32,cy=32)
+FIX v77.1: env.reset() returns (obs,info) tuple — _phase2 baseline uses safe_step instead
 """
 import numpy as np
 from collections import deque
@@ -23,6 +24,15 @@ def _get_grid(frame):
     if fr is not None and len(fr) > 0:
         return np.asarray(fr[0], dtype=np.int32)
     return np.zeros((64, 64), dtype=np.int32)
+
+
+def _get_grid_any(obj):
+    """Extract grid from Frame, (obs,info) tuple, or ndarray."""
+    if isinstance(obj, np.ndarray):
+        return obj.astype(np.int32) if obj.ndim == 2 else obj[0].astype(np.int32)
+    if isinstance(obj, tuple):
+        return _get_grid_any(obj[0])
+    return _get_grid(obj)
 
 
 def _grid_hash(grid):
@@ -48,13 +58,11 @@ class DenseExplorer:
         self.live_clicks = []  # [(x, y, state_hash), ...]
 
     def _safe_step(self, action_idx, cx=32, cy=32):
-        """Step via step_adapter.safe_step (complex=always data, fail-fast)."""
         self._total_steps += 1
         return safe_step(self._env, self._actions[action_idx], cx, cy)
 
     # ── Phase 1: Simple action brute ──
     def _phase1_simple_brute(self, budget):
-        """Try each simple action repeatedly up to budget."""
         for aidx in self._simple_indices:
             if self._total_steps >= budget:
                 return None
@@ -71,13 +79,30 @@ class DenseExplorer:
 
     # ── Phase 2: Dense click scan (1024 positions, stride=2) ──
     def _phase2_dense_scan(self, max_positions=1024):
-        """Try every click position. Return solution or list of live clicks."""
+        """Try every click position. Return solution or list of live clicks.
+
+        FIX v77.1: baseline computed from safe_step(simple_action) rather than
+        env.reset() which returns (obs,info) tuple, not Frame.
+        If no simple action exists, use safe_step(click_idx, -1, -1) which
+        safe_step will reject (no x/y for complex) — so use a corner click as fallback.
+        """
         live_clicks = []
 
-        # Baseline: true initial state (no action executed)
-        _bf = self._env.reset()
-        _bg = _get_grid(_bf)
-        baseline_hash = _grid_hash(_bg)
+        # Baseline: take a no-op-like action to get a proper Frame
+        # Use first simple action if available, else corner click
+        self._env.reset()
+        if self._simple_indices:
+            _bf = self._safe_step(self._simple_indices[0])
+        else:
+            # no simple action — use click at (0, 0) as reference baseline
+            _bf = self._safe_step(self._click_idx, 0, 0) if self._click_idx is not None else None
+
+        if _bf is None:
+            # complete fallback: hash of zeros
+            baseline_hash = _grid_hash(np.zeros((64, 64), dtype=np.int32))
+        else:
+            _bg = _get_grid(_bf)
+            baseline_hash = _grid_hash(_bg)
 
         for pi, (px, py) in enumerate(_ALL_POSITIONS):
             if pi >= max_positions or self._total_steps >= self._budget:
@@ -95,21 +120,14 @@ class DenseExplorer:
                 live_clicks.append((px, py, h))
         return "LIVE_CLICKS" if live_clicks else "NO_LIVE", live_clicks
 
-    # ── Phase 3: Replay BFS from live clicks (Occam-style) ──
+    # ── Phase 3: Replay BFS from live clicks ──
     def _replay_bfs(self, live_clicks, max_steps):
-        """Reset-replay BFS: env.reset() → replay prefix → try all actions.
-
-        FIX v75.2: when expanding click actions, uses live_click coords
-        from the discovered states instead of hardcoded (32,32).
-        """
+        """Reset-replay BFS: env.reset() → replay prefix → try all actions."""
         if not live_clicks:
             return False
 
-        # Deduplicate live clicks by state hash
         seen = set()
-        # frontier nodes: (state_hash, prefix: list[(aidx, cx, cy)])
-        # Store live_click_xy per node for targeted expansion
-        frontier_nodes = []  # (hash, prefix, live_xy_list)
+        frontier_nodes = []
         for px, py, h in live_clicks:
             if h not in seen:
                 seen.add(h)
@@ -118,15 +136,12 @@ class DenseExplorer:
         explored = set(seen)
 
         while frontier_nodes and self._total_steps < self._budget:
-            # BFS: pop shortest prefix first
             frontier_nodes.sort(key=lambda n: len(n[1]))
             cur_hash, prefix, node_live_xy = frontier_nodes.pop(0)
 
-            # Replay prefix to reach this state
             if not self._replay_prefix(prefix):
                 continue
 
-            # Try all simple actions
             for aidx in self._simple_indices:
                 if self._total_steps >= self._budget:
                     return self.solution is not None
@@ -142,12 +157,9 @@ class DenseExplorer:
                     explored.add(nh)
                     frontier_nodes.append((nh, list(prefix) + [(aidx, 32, 32)], node_live_xy))
 
-            # Try click actions: use coords from live_clicks for this node
-            # FIX: use the actual coordinates discovered, not (32,32)
-            coords_to_try = node_live_xy[:10]  # top 10 from this node's context
-            # Also try global live_clicks for cross-pollination
+            coords_to_try = list(node_live_xy[:10])
             for lcx, lcy, _ in live_clicks[:5]:
-                if (lcx, lcy) not in [(x, y) for x, y in coords_to_try]:
+                if (lcx, lcy) not in coords_to_try:
                     coords_to_try.append((lcx, lcy))
 
             if self._click_idx is not None:
@@ -167,13 +179,12 @@ class DenseExplorer:
                         frontier_nodes.append((
                             nh,
                             list(prefix) + [(self._click_idx, lcx, lcy)],
-                            [(lcx, lcy)]  # pass coords forward
+                            [(lcx, lcy)]
                         ))
 
         return self.solution is not None
 
     def _replay_prefix(self, prefix):
-        """env.reset() → step through prefix actions. Returns True if all steps succeeded."""
         self._env.reset()
         for aidx, cx, cy in prefix:
             nf = self._safe_step(aidx, cx, cy)
@@ -183,7 +194,6 @@ class DenseExplorer:
 
     # ── Phase 4: 1px refinement ──
     def _refine_live_clicks(self, live_clicks):
-        """Try ±3px around unique live click centers."""
         seen = set()
         unique_centers = []
         for px, py, h in live_clicks:
@@ -210,23 +220,18 @@ class DenseExplorer:
 
     # ── Main entry ──
     def explore(self, max_steps=2000, dense_scan_first=True):
-        """Main loop. Returns True if solution found.
-
-        Pipeline: simple brute → dense scan → replay BFS → refinement
-        """
+        """Main loop. Returns True if solution found."""
         self._budget = max_steps
         self._total_steps = 0
         self.solution = None
         self.live_clicks = []
 
-        # Phase 1: Simple action brute
         if self._simple_indices:
             sol = self._phase1_simple_brute(max_steps)
             if sol:
                 self.solution = sol
                 return True
 
-        # Phase 2: Dense click scan
         if self._click_idx is not None and self._total_steps < self._budget:
             result, data = self._phase2_dense_scan(1024)
             if result == "WIN":
@@ -234,13 +239,11 @@ class DenseExplorer:
             if result == "LIVE_CLICKS":
                 self.live_clicks = data
 
-        # Phase 3: Replay BFS from live clicks
         if self.live_clicks and self._total_steps < self._budget:
             self._replay_bfs(self.live_clicks, max_steps // 2)
             if self.solution:
                 return True
 
-        # Phase 4: 1px refinement
         if not self.solution and self.live_clicks and self._total_steps < self._budget:
             self._refine_live_clicks(self.live_clicks)
 
