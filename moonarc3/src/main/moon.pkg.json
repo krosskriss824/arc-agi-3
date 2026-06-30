@@ -1,0 +1,18 @@
+{
+  "is-main": true,
+  "import": [{"path": "moonarc3/rhae/src/rhae", "alias": "rhae"}],
+  "link": {
+    "wasm": {
+      "exported-functions": [
+        "rhae_invariants", "rhae_canonical_hash", "rhae_get_hash_hi",
+        "rhae_visited_check", "rhae_visited_mark", "rhae_visited_reset",
+        "rhae_policy_gate", "rhae_build_candidates", "rhae_topk",
+        "rhae_tt_lookup", "rhae_tt_store", "rhae_hash_and_check",
+        "set_grid_cell", "set_prev_cell", "set_visited", "set_risk",
+        "get_inv", "get_mat", "get_topk",
+        "zobrist_init", "encode_action", "decode_action"
+      ],
+      "export-memory-name": "memory"
+    }
+  }
+}
