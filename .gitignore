@@ -12,3 +12,7 @@ __pycache__/
 *.wasm
 /data/
 /tmp/
+
+kaggle_staging/_archive/
+kaggle_mcts_cpu/
+MAIN!/
